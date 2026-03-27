@@ -23,19 +23,15 @@ _request_queues = {
     "extralarge": 60,
 }
 
-_perms = itertools.product(_sizes.keys(), _obs_types, range(1,20), range(1, 10))
-
-for size, obs_type, num_agvs, num_pickers in _perms:
-    # normal tasks
+for size, obs_type, num_agvs in itertools.product(_sizes.keys(), _obs_types, range(1, 20)):
     gym.register(
-        id=f"tarware-{size}-{num_agvs}agvs-{num_pickers}pickers-{obs_type}obs-v1",
+        id=f"tarware-{size}-{num_agvs}agvs-{obs_type}obs-v1",
         entry_point="tarware.warehouse:Warehouse",
         kwargs={
             "column_height": 8,
             "shelf_rows": _sizes[size][0],
             "shelf_columns": _sizes[size][1],
-            "num_agvs":  num_agvs,
-            "num_pickers": num_pickers,
+            "num_agvs": num_agvs,
             "request_queue_size": _request_queues[size],
             "max_inactivity_steps": None,
             "max_steps": 500,
@@ -43,25 +39,3 @@ for size, obs_type, num_agvs, num_pickers in _perms:
             "observation_type": obs_type,
         },
     )
-
-def full_registration():
-    _perms = itertools.product(_sizes.keys(), _obs_types, _request_queues, range(1,20), range(1, 10),)
-    for size, obs_type, num_agvs, num_pickers in _perms:
-        # normal tasks with modified column height
-        gym.register(
-            id=f"tarware-{size}-{num_agvs}agvs-{num_pickers}pickers-{obs_type}obs-v1",
-            entry_point="tarware.warehouse:Warehouse",
-            kwargs={
-                "column_height": 8,
-                "shelf_rows": _sizes[size][0],
-                "shelf_columns": _sizes[size][1],
-                "num_agvs":  num_agvs,
-                "num_pickers": num_pickers,
-                "sensor_range": 1,
-                "request_queue_size": _request_queues[size],
-                "max_inactivity_steps": None,
-                "max_steps": 500,
-                "reward_type": RewardType.INDIVIDUAL,
-                "observation_type": obs_type,
-            },
-        )

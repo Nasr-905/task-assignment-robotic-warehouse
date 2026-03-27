@@ -3,8 +3,6 @@ from enum import Enum, IntEnum
 
 class AgentType(Enum):
     AGV = 0
-    PICKER = 1
-    AGENT = 2
 
 class Action(Enum):
     NOOP = 0
