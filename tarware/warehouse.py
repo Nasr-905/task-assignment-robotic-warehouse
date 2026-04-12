@@ -720,7 +720,7 @@ class Warehouse(gym.Env):
                 agent.busy = False
                 agent.has_delivered = False
                 if self.reward_type == RewardType.GLOBAL:
-                    rewards += 0.5
+                    rewards += 1
                 elif self.reward_type == RewardType.INDIVIDUAL:
                     rewards[agent.id - 1] += 0.1
         return rewards
