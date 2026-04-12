@@ -3,6 +3,8 @@ from enum import Enum, IntEnum
 
 class AgentType(Enum):
     AGV = 0
+    PICKER = 1
+    AGENT = 2  # backward-compat alias
 
 class Action(Enum):
     NOOP = 0
@@ -10,6 +12,7 @@ class Action(Enum):
     RIGHT = 2
     FORWARD = 3
     TOGGLE_LOAD = 4
+    PICK = 5
 
 class Direction(Enum):
     UP = 0

@@ -1,41 +1,80 @@
-import itertools
+import os
+from pathlib import Path
 
 import gymnasium as gym
 
-from tarware.spaces import observation_map
 from tarware.warehouse import RewardType
 
-_obs_types = list(observation_map.keys())
+# CSV Path to the warehouse map data to be used in the environment. Can be set via 
+# the TARWARE_MAP_NAME environment variable, or defaults to "medium" in the 
+# data/maps directory.
+_MAP_NAME = os.getenv("TARWARE_MAP_NAME", "medium")
+_MAP_CSV_FILENAME = f"{_MAP_NAME}.csv"
+_MAP_CSV_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data" / "maps" / _MAP_CSV_FILENAME
+)
+# CSV Path of the order data to be used in the environment. Can be set via the 
+# TARWARE_ORDER_DATA environment variable, or defaults to "order_data_sample" 
+# in the data/processed directory.
+_ORDER_DATA = os.getenv("TARWARE_ORDER_DATA", "order_data_sample")
+_ORDER_CSV_FILENAME = f"{_ORDER_DATA}.csv"
+_ORDER_CSV_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data" / "processed" / _ORDER_CSV_FILENAME
+)
+# CSV Path of the ABC analysis data to be used in the environment. Can be set via the 
+# TARWARE_ABC_CSV environment variable, or defaults to "abc_data_sample.csv" in the 
+# data/processed directory.
+_ABC_CSV_FILENAME = os.getenv("TARWARE_ABC_CSV", "abc_data_sample.csv")
+_ABC_CSV_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data" / "processed" / _ABC_CSV_FILENAME
+)
 
-_sizes = {
-    "tiny": (1, 3),
-    "small": (2, 3),
-    "medium": (2, 5),
-    "large": (3, 5),
-    "extralarge": (4, 7),
-}
+# Number of AGVs (defaults to 3)
+_NUM_AGVS = int(os.getenv("TARWARE_AGVS", 3))
+# Number of pickers (defaults to 4)
+_NUM_PICKERS = int(os.getenv("TARWARE_PICKERS", 4))
+# Observation type (defaults to "partial")
+_OBS_TYPE = os.getenv("TARWARE_OBS_TYPE", "partial")
+# Request queue size (defaults to 20)
+_REQUEST_QUEUE_SIZE = int(os.getenv("TARWARE_REQUEST_QUEUE_SIZE", 20))
+# Steps per simulated second (defaults to 1.0)
+_STEPS_PER_SIMULATED_SECOND = float(os.getenv("TARWARE_STEPS_PER_SIMULATED_SECOND", 1.0))
+# Maximum inactivity steps before episode termination (defaults to None, meaning no 
+# termination based on inactivity)
+_MAX_INACTIVITY_STEPS = os.getenv("TARWARE_MAX_INACTIVITY_STEPS", None)
+if _MAX_INACTIVITY_STEPS is not None:
+    _MAX_INACTIVITY_STEPS = int(_MAX_INACTIVITY_STEPS)
+# Maximum steps per episode (defaults to 500)
+_MAX_STEPS = int(os.getenv("TARWARE_MAX_STEPS", 500))
+# Reward type (defaults to "global")
+_REWARD_TYPE = os.getenv("TARWARE_REWARD_TYPE", "global")
+if _REWARD_TYPE == "global":
+    _REWARD_TYPE = RewardType.GLOBAL
+elif _REWARD_TYPE == "individual":
+    _REWARD_TYPE = RewardType.INDIVIDUAL
+elif _REWARD_TYPE == "two_stage":
+    _REWARD_TYPE = RewardType.TWO_STAGE
+else:
+    raise ValueError(f"Invalid reward type: {_REWARD_TYPE}. Must be 'individual', 'global', or 'two_stage'.")
 
-_request_queues = {
-    "tiny": 20,
-    "small": 20,
-    "medium": 20,
-    "large": 40,
-    "extralarge": 60,
-}
+ENV_ID: str = f"tarware/map-{_MAP_NAME}_order-{_ORDER_DATA}_agvs-{_NUM_AGVS}_pickers-{_NUM_PICKERS}_obs-{_OBS_TYPE}_v1"
 
-for size, obs_type, num_agvs in itertools.product(_sizes.keys(), _obs_types, range(1, 20)):
-    gym.register(
-        id=f"tarware-{size}-{num_agvs}agvs-{obs_type}obs-v1",
-        entry_point="tarware.warehouse:Warehouse",
-        kwargs={
-            "column_height": 8,
-            "shelf_rows": _sizes[size][0],
-            "shelf_columns": _sizes[size][1],
-            "num_agvs": num_agvs,
-            "request_queue_size": _request_queues[size],
-            "max_inactivity_steps": None,
-            "max_steps": 500,
-            "reward_type": RewardType.INDIVIDUAL,
-            "observation_type": obs_type,
-        },
-    )
+gym.register(
+    id=ENV_ID,
+    entry_point="tarware.warehouse:Warehouse",
+    kwargs={
+        "map_csv_path": _MAP_CSV_PATH,
+        "order_csv_path": _ORDER_CSV_PATH,
+        "num_agvs": _NUM_AGVS,
+        "num_pickers": _NUM_PICKERS,
+        "observation_type": _OBS_TYPE,
+        "request_queue_size": _REQUEST_QUEUE_SIZE,
+        "steps_per_simulated_second": _STEPS_PER_SIMULATED_SECOND,
+        "max_inactivity_steps": _MAX_INACTIVITY_STEPS,
+        "max_steps": _MAX_STEPS,
+        "reward_type": _REWARD_TYPE,
+    },
+)

@@ -1,7 +1,4 @@
-"""
-2D rendering of the Robotic's Warehouse
-environment using pyglet
-"""
+"""2D rendering of the warehouse environment using pyglet."""
 
 import math
 import os
@@ -45,7 +42,6 @@ except ImportError as e:
 
 
 RAD2DEG = 57.29577951308232
-# # Define some colors
 _BLACK = (0, 0, 0)
 _WHITE = (255, 255, 255)
 _GREEN = (0, 255, 0)
@@ -66,8 +62,19 @@ _AGENT_COLOR = _DARKORANGE
 _AGENT_LOADED_COLOR = _RED
 _AGENT_DIR_COLOR = _BLACK
 _GOAL_COLOR = (60, 60, 60)
+_SHELF_FULFILLED_COLOR = (0, 160, 80)   # green: pickerwall shelf fully picked, ready to displace
 _CARRIER_COLOR = _MAROON
 _LOADER_AGENT = _BLUE
+
+_PICKER_ZONE_COLOR = (200, 230, 255)   # light blue background for picker zone
+_REPLENISHMENT_ZONE_COLOR = (220, 255, 220)  # light green background for replenishment zone
+_REPLENISHMENT_SHELF_COLOR = (50, 200, 50)   # bright green: fresh stock shelf in replenishment zone
+_DEPLETED_SHELF_COLOR = (180, 60, 60)        # muted red: shelf with exhausted stock
+_PACKAGING_COLOR = (255, 215, 0)       # gold for packaging locations (idle)
+_PACKAGING_PARTIAL_COLOR = (255, 140, 0)   # dark orange: station has partial orders in progress
+_PACKAGING_FILL_COLOR = (200, 80, 0)       # deep orange: filled portion of in-progress bar
+_PICKER_COLOR = (0, 180, 90)           # green for idle/walking pickers
+_PICKER_PICKING_COLOR = (255, 100, 0)  # orange while actively picking
 
 _SHELF_PADDING = 2
 
@@ -122,9 +129,13 @@ class Viewer(object):
         self.window.dispatch_events()
 
         self._draw_grid()
+        self._draw_picker_zone(env)
+        self._draw_replenishment_zone(env)
         self._draw_goals(env)
+        self._draw_packaging(env)
         self._draw_shelfs(env)
         self._draw_agents(env)
+        self._draw_pickers(env)
 
         if return_rgb_array:
             buffer = pyglet.image.get_buffer_manager().get_color_buffer()
@@ -178,11 +189,16 @@ class Viewer(object):
         batch = pyglet.graphics.Batch()
 
         for shelf in env.shelfs:
+            if not shelf.on_grid:
+                continue
             x, y = shelf.x, shelf.y
             y = self.rows - y - 1  # pyglet rendering is reversed
-            shelf_color = (
-                _SHELF_REQ_COLOR if shelf in env.request_queue else _SHELF_COLOR
-            )
+            if shelf.depleted:
+                shelf_color = _DEPLETED_SHELF_COLOR
+            elif shelf.from_replenishment:
+                shelf_color = _REPLENISHMENT_SHELF_COLOR
+            else:
+                shelf_color = _SHELF_REQ_COLOR if shelf in env.request_queue else _SHELF_COLOR
 
             batch.add(
                 4,
@@ -205,11 +221,40 @@ class Viewer(object):
             )
         batch.draw()
 
+        # Draw capacity labels on each shelf
+        for shelf in env.shelfs:
+            if not shelf.on_grid:
+                continue
+            sx, sy = shelf.x, shelf.y
+            sy = self.rows - sy - 1
+            cx = (self.grid_size + 1) * sx + self.grid_size // 2 + 1
+            cy = (self.grid_size + 1) * sy + self.grid_size // 2 + 1
+            label = pyglet.text.Label(
+                str(shelf.capacity),
+                font_name="Arial",
+                font_size=7,
+                x=cx, y=cy,
+                anchor_x="center", anchor_y="center",
+                color=(255, 255, 255, 255),
+            )
+            label.draw()
+
     def _draw_goals(self, env):
         batch = pyglet.graphics.Batch()
 
+        fulfilled_positions = set()
+        if hasattr(env, "shelfs") and hasattr(env, "grid"):
+            from tarware.definitions import CollisionLayers
+            for gx, gy in env.goals:
+                shelf_id = env.grid[CollisionLayers.SHELVES, gy, gx]
+                if shelf_id != 0:
+                    shelf = env.shelfs[shelf_id - 1]
+                    if shelf.fulfilled:
+                        fulfilled_positions.add((gx, gy))
+
         for goal in env.goals:
             x, y = goal
+            color = _SHELF_FULFILLED_COLOR if (x, y) in fulfilled_positions else _GOAL_COLOR
             y = self.rows - y - 1  # pyglet rendering is reversed
             batch.add(
                 4,
@@ -228,9 +273,134 @@ class Viewer(object):
                         (self.grid_size + 1) * (y + 1),  # BL - Y
                     ),
                 ),
-                ("c3B", 4 * _GOAL_COLOR),
+                ("c3B", 4 * color),
             )
         batch.draw()
+
+    def _draw_picker_zone(self, env):
+        if not hasattr(env, "agv_zone_height") or env.agv_zone_height >= env.grid_size[0]:
+            return
+        batch = pyglet.graphics.Batch()
+        gs = self.grid_size + 1
+        for row in range(env.agv_zone_height, env.grid_size[0]):
+            y = self.rows - row - 1  # pyglet reversed
+            for col in range(env.grid_size[1]):
+                batch.add(
+                    4, gl.GL_QUADS, None,
+                    ("v2f", (
+                        gs * col + 1,        gs * y + 1,
+                        gs * (col + 1),      gs * y + 1,
+                        gs * (col + 1),      gs * (y + 1),
+                        gs * col + 1,        gs * (y + 1),
+                    )),
+                    ("c3B", 4 * _PICKER_ZONE_COLOR),
+                )
+        batch.draw()
+
+    def _draw_replenishment_zone(self, env):
+        if not hasattr(env, "replenishment_locs") or not env.replenishment_locs:
+            return
+        batch = pyglet.graphics.Batch()
+        gs = self.grid_size + 1
+        for (rx, ry) in env.replenishment_locs:
+            y = self.rows - ry - 1
+            batch.add(
+                4, gl.GL_QUADS, None,
+                ("v2f", (
+                    gs * rx + 1,        gs * y + 1,
+                    gs * (rx + 1),      gs * y + 1,
+                    gs * (rx + 1),      gs * (y + 1),
+                    gs * rx + 1,        gs * (y + 1),
+                )),
+                ("c3B", 4 * _REPLENISHMENT_ZONE_COLOR),
+            )
+        batch.draw()
+
+    def _draw_packaging(self, env):
+        if not hasattr(env, "packaging_locations"):
+            return
+
+        partial_slots = []
+        if hasattr(env, "_packaging_slots"):
+            partial_slots = sorted(
+                ((order_num, s["delivered"], s["required"])
+                 for order_num, s in env._packaging_slots.items()
+                 if s["required"] > 0),
+                key=lambda t: t[0],
+            )
+
+        gs = self.grid_size + 1
+        pad = _SHELF_PADDING
+
+        for i, (px, py) in enumerate(env.packaging_locations):
+            y = self.rows - py - 1
+
+            x0 = gs * px + pad + 1
+            x1 = gs * (px + 1) - pad
+            y0 = gs * y + pad + 1
+            y1 = gs * (y + 1) - pad
+
+            # Each square holds at most one partial order (assigned by sorted index)
+            order_info = partial_slots[i] if i < len(partial_slots) else None
+
+            base_color = _PACKAGING_PARTIAL_COLOR if order_info else _PACKAGING_COLOR
+            base_batch = pyglet.graphics.Batch()
+            base_batch.add(
+                4, gl.GL_QUADS, None,
+                ("v2f", (x0, y0, x1, y0, x1, y1, x0, y1)),
+                ("c3B", 4 * base_color),
+            )
+            base_batch.draw()
+
+            if order_info:
+                _order_num, delivered, required = order_info
+                fill_ratio = delivered / required if required > 0 else 0.0
+
+                if fill_ratio > 0:
+                    # Vertical progress bar filling from the bottom up
+                    fill_y1 = y0 + (y1 - y0) * fill_ratio
+                    fill_batch = pyglet.graphics.Batch()
+                    fill_batch.add(
+                        4, gl.GL_QUADS, None,
+                        ("v2f", (x0, y0, x1, y0, x1, fill_y1, x0, fill_y1)),
+                        ("c3B", 4 * _PACKAGING_FILL_COLOR),
+                    )
+                    fill_batch.draw()
+
+                # Label: "delivered/required" centred in the square
+                cx = (x0 + x1) // 2
+                cy = (y0 + y1) // 2
+                pyglet.text.Label(
+                    f"{delivered}/{required}",
+                    font_name="Arial",
+                    font_size=6,
+                    bold=True,
+                    x=cx, y=cy,
+                    anchor_x="center", anchor_y="center",
+                    color=(255, 255, 255, 255),
+                ).draw()
+
+    def _draw_pickers(self, env):
+        if not hasattr(env, "pickers") or not env.pickers:
+            return
+        from tarware.warehouse import PickerState
+        radius = self.grid_size / 3
+        for picker in env.pickers:
+            col, row = picker.x, picker.y
+            row = self.rows - row - 1
+            cx = (self.grid_size + 1) * col + self.grid_size // 2 + 1
+            cy = (self.grid_size + 1) * row + self.grid_size // 2 + 1
+            # Diamond shape (4 vertices)
+            verts = [
+                cx, cy + radius,    # top
+                cx + radius, cy,    # right
+                cx, cy - radius,    # bottom
+                cx - radius, cy,    # left
+            ]
+            diamond = pyglet.graphics.vertex_list(4, ("v2f", verts))
+            color = _PICKER_PICKING_COLOR if picker.state == PickerState.PICKING else _PICKER_COLOR
+            gl.glColor3ub(*color)
+            diamond.draw(gl.GL_POLYGON)
 
     def _draw_agents(self, env):
         agents = []
@@ -252,7 +422,6 @@ class Viewer(object):
             else:
                 raise ValueError("Agent type not recognized by environment.")
             
-            # make a circle
             verts = []
             for i in range(resolution):
                 angle = 2 * math.pi * i / resolution
@@ -325,7 +494,6 @@ class Viewer(object):
         badge_x = col * self.grid_size + (3 / 4) * self.grid_size
         badge_y = self.height - self.grid_size * (row + 1) + (1 / 4) * self.grid_size
 
-        # make a circle
         verts = []
         for i in range(resolution):
             angle = 2 * math.pi * i / resolution
