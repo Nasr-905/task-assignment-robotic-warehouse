@@ -1,0 +1,7 @@
+Instructions
+
+- The data provided includes eCom and Retail orders. Coulmn H indicates order type
+- Date format in Column B is YYYYMMDD
+- Column C is time stamp. The format for time stamp is HH:MM:SS with a 24 hr clock. You'll need to add leading zeros to get the correct 6 digit time stamp
+- Column I flags items that are deemed large - we'd want at least 4 units per bin so please remove those lines from the analysis
+- Refer to 'Data in scope' tab for the dates to be considered for analysis
