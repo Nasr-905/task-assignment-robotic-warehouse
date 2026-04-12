@@ -1,0 +1,76 @@
+============================================================
+SPREADSHEET SUMMARY — Order Details UofT Capstone V2
+============================================================
+
+============================================================
+SHEET: Instructions
+============================================================
+Instructions
+
+- The data provided includes eCom and Retail orders. Coulmn H indicates order type
+- Date format in Column B is YYYYMMDD
+- Column C is time stamp. The format for time stamp is HH:MM:SS with a 24 hr clock. You'll need to add leading zeros to get the correct 6 digit time stamp
+- Column I flags items that are deemed large - we'd want at least 4 units per bin so please remove those lines from the analysis
+- Refer to 'Data in scope' tab for the dates to be considered for analysis
+
+
+============================================================
+SHEET: Data in Scope
+============================================================
+Use below dates for analysis/ simulation results,,
+,,
+Large Lines,Removed,
+,,
+Ship Date,Active SKUs,Qty Shipped
+20260114," 16,817 "," 44,361 "
+20260111," 16,073 "," 43,719 "
+20260108," 15,774 "," 30,632 "
+20260107," 15,296 "," 28,813 "
+20260110," 13,928 "," 24,246 "
+20260119," 6,155 "," 8,384 "
+20251227," 3,893 "," 5,476 "
+ Total ,," 185,631 "
+
+
+============================================================
+SHEET: Location Master
+============================================================
+,w,d,h,cube,% utilization,usable cube,,
+Bin,15.87,23.74,12.28,2.68,85%,2.28,,
+,,,,,,,,
+,,,,,,,,
+,w,d,h,# bins per level,# levels per bay,# bins per bay,aisle,sqft per bay
+Handstack,96,48,96,5,5,50,6,57.75
+
+
+============================================================
+SHEET: Sizing
+============================================================
+ Storage ,,,
+Bins,"75,880",,
+Bays,"1,518",37.95,18.975
+Sqftage Needed,"105,197",,
+,,,
+Picker Wall ,,,
+Max Active SKUs / 2HR Period / Day,"4,035",--> this is the max capacity of picker wall,
+Active Totes / SKU,1,,
+Locations,"4,035",,
+Bays,162,4.05,
+Sqftage Needed,"11,227",,
+,,,
+dedicated bot aisles and picker aisles,,,
+an area for decanting (decant into totes),,,
+assume 10 units/bin/tote,,,
+place tote with product onto shelf and bot pick,,,
+,,,
+5' for aisles,,,
+8' for picker aisles,,,
+,,,
+Decant,,,
+Peak Daily Units Decanted,"41,737",,
+Turns,4,,
+Peak Daily Units Staged in Decant,"10,434",,
+Peak Daily Bins Staged in Decant,"1,043",,
+Peak Bays Needed,42,,
+
+

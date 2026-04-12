@@ -10,12 +10,8 @@ from typing import Sequence
 
 import gymnasium as gym
 import numpy as np
-import tarware  # noqa: F401 (registers envs)
 from dotenv import load_dotenv
-import stable_baselines3 as sb3  # noqa: F401 (optional dependency for RL workflows)
-
-from tarware.heuristic import heuristic_episode
-
+import stable_baselines3 as sb3
 
 # Load environment variables from .env file
 if __name__ == "__main__":
@@ -23,8 +19,10 @@ if __name__ == "__main__":
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
     )
     sys.path.append(os.path.dirname(dotenv_path))
-    load_dotenv()
+    load_dotenv(dotenv_path)
 
+import tarware
+from tarware.heuristic import heuristic_episode
 
 LOGGER = logging.getLogger(__name__)
 
@@ -79,22 +77,12 @@ def configure_logging(log_level: str) -> None:
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def build_env_id(size: str, agvs: int, obs_type: str = "partial") -> str:
-    return f"tarware-{size}-{agvs}agvs-{obs_type}obs-v1"
+def build_env_id(size: str, agvs: int, pickers: int, obs_type: str = "partial") -> str:
+    return f"tarware-{size}-{agvs}agvs-{pickers}pickers-{obs_type}obs-v1"
 
 
-def get_env_and_id(args):
-    env_id = build_env_id(args.size, args.agvs, args.obs_type)
-
-    if not args.enable_env_checker:
-        warnings.filterwarnings(
-            "ignore",
-            category=UserWarning,
-            module=r"gymnasium\.utils\.passive_env_checker",
-        )
-
-    env = gym.make(env_id, disable_env_checker=not args.enable_env_checker)
-    return env, env_id
+def get_env_and_id():
+    return env, ENV_ID
 
 
 class JointWarehouseWrapper(gym.Wrapper):
@@ -169,6 +157,12 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
         help="Number of AGV agents.",
     )
     parser.add_argument(
+        "--pickers",
+        type=int,
+        default=env_int("TARWARE_PICKERS", 0),
+        help="Number of picker agents.",
+    )
+    parser.add_argument(
         "--obs-type",
         default=os.getenv("TARWARE_OBS_TYPE", "partial"),
         choices=["partial", "global"],
@@ -188,10 +182,8 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
 
 
 def run_classical_eval(args) -> None:
-    env, env_id = get_env_and_id(args)
-    LOGGER.info("classical_eval env_id=%s", env_id)
-    if hasattr(env.unwrapped, "max_steps"):
-        env.unwrapped.max_steps = args.steps
+    env = gym.make(tarware.ENV_ID)
+    LOGGER.info("classical_eval env_id=%s", tarware.ENV_ID)
     try:
         for episode in range(args.episodes):
             episode_seed = args.seed + episode
@@ -200,7 +192,6 @@ def run_classical_eval(args) -> None:
                 render=args.render,
                 seed=episode_seed,
             )
-
             total_deliveries = sum(info.get("shelf_deliveries", 0) for info in infos)
             total_clashes = sum(info.get("clashes", 0) for info in infos)
             total_stucks = sum(info.get("stucks", 0) for info in infos)

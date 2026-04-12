@@ -18,7 +18,7 @@ class _VectorWriter:
 
 
 class MultiAgentBaseObservationSpace(ABC):
-    def __init__(self, num_agvs, num_pickers, grid_size, shelf_locations, msg_bits, normalised_coordinates=False):
+    def __init__(self, num_agvs, num_pickers, grid_size, shelf_locations, normalised_coordinates=False):
         self.num_agvs = num_agvs
         self.num_pickers = num_pickers
         self.num_agents = num_agvs + num_pickers
@@ -30,7 +30,8 @@ class MultiAgentBaseObservationSpace(ABC):
 
     def process_coordinates(self, coords, environment):
         if self.normalised_coordinates:
-            return (coords[0] / (environment.grid_size[0] - 1), coords[1] / (environment.grid_size[1] - 1))
+            gs = environment.grid_size
+            return (coords[0] / (gs[0] - 1), coords[1] / (gs[1] - 1))
         else:
             return coords
     
