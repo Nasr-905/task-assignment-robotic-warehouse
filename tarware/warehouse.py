@@ -22,8 +22,17 @@ logger = logging.getLogger(__name__)
 
 _FIXING_CLASH_TIME = 4
 _STUCK_THRESHOLD = 5
+_PICKER_BLOCKED_REROUTE_THRESHOLD = 4  # consecutive blocked steps before a picker detours
 _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
-_AGV_WALKABLE_TILES = {0, 2, 5, 6}
+# Tiles:
+# - 0: AGV highway
+# - 1: shelf/storage
+# - 2: pickerwall
+# - 3: picker highway
+# - 4: packaging
+# - 5: replenishment (AGV take-only)
+# - 6: shared highway
+_AGV_WALKABLE_TILES = {0, 5, 6}
 _PICKER_WALKABLE_TILES = {3, 4, 6}
 _SHARED_HIGHWAY_TILE = 6
 
@@ -154,6 +163,8 @@ class Picker(Entity):
         self.path: List = []
         self.pick_ticks_remaining: int = 0
         self.capacity: int = Picker.CAPACITY
+        self.blocked_ticks: int = 0   # consecutive steps spent waiting on a blocked cell
+        self.fixing_clash: int = 0    # cooldown after rerouting; mirrors Agent.fixing_clash
 
 
 class Warehouse(gym.Env):
@@ -294,6 +305,8 @@ class Warehouse(gym.Env):
             for r in range(num_rows)
             if tile_grid[r, c] == 1
         ]
+        # Quick (col, row) lookup set for shelf cells
+        self._shelf_locs_xy_set: set = {(c, r) for (r, c) in self.shelf_locs}
 
         # Replenishment cells: staging zone for fresh stock (AGV take-only)
         self.replenishment_locs: List[Tuple[int, int]] = [
@@ -325,6 +338,25 @@ class Warehouse(gym.Env):
                 and self.picker_highways[ny, nx] == 1
             ]
             self._goal_to_picker_entry[(gx, gy)] = entries
+
+        # Per-goal AGV entry points: highway cells adjacent to each goal (for side drop-off).
+        # AGVs deposit shelves from an adjacent highway cell rather than entering the goal cell.
+        self._goal_to_agv_entry: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        for (gx, gy) in self.goals:
+            entries = [
+                (nx, ny)
+                for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)]
+                if 0 <= ny < num_rows and 0 <= nx < num_cols
+                and self.highways[ny, nx] == 1       # AGV-walkable
+                and (nx, ny) not in self.goals        # not another goal slot
+            ]
+            self._goal_to_agv_entry[(gx, gy)] = entries
+
+        # Reverse: AGV-entry (col, row) → goal (col, row)
+        self._agv_entry_to_goal: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        for goal_xy, entries in self._goal_to_agv_entry.items():
+            for entry_xy in entries:
+                self._agv_entry_to_goal[entry_xy] = goal_xy
 
         # Action IDs: 1..num_goals (pickerwall), then storage, then replenishment
         self.action_id_to_coords_map = {i + 1: (r, c) for i, (c, r) in enumerate(self.goals)}
@@ -387,6 +419,76 @@ class Warehouse(gym.Env):
             return [(x, y) for y, x in astar_path]
         else:
             return []
+        
+    def find_agv_path_through_adjacent_loc(self, start, goal: Tuple[int], agent: Tuple[int], care_for_agents: bool = True) -> List[Tuple[int]]:
+        """Find path from start to goal that goes through via. Returns [] if no path exists."""
+        gr, gc = goal
+        rows, cols = self.grid_size
+        adjacent = [
+            (gr - 1, gc), (gr + 1, gc), (gr, gc - 1), (gr, gc + 1)
+        ]
+        entries = [
+            (r, c) for (r, c) in adjacent
+            if 0 <= r < rows and 0 <= c < cols
+            and self.highways[r, c] == 1
+        ]
+        best_via = None
+        best_path: List[Tuple[int, int]] = []
+        for entry_rc in entries:
+            p = self.find_agv_path(start, entry_rc, agent, care_for_agents)
+            if p and (not best_path or len(p) < len(best_path)):
+                best_via = entry_rc
+                best_path = p
+        via = best_via
+        path_to_via = best_path
+        if not path_to_via:
+            return []
+        path_from_via = self.find_agv_path(via, goal, agent, care_for_agents)
+        if not path_from_via:
+            return []
+        return path_to_via + path_from_via
+    
+    def find_agv_path_to_target_entry(self, start: Tuple[int, int], target_rc: Tuple[int, int],
+                                      agent: "Agent", care_for_agents: bool = True) -> List[Tuple[int, int]]:
+        """Route an AGV to the nearest highway cell adjacent to target_rc (row, col).
+
+        Used when the target is a non-highway cell (shelf tile 1) so the AGV
+        stops next to it and interacts sideways.  start is (row, col).
+        Returns [] when no adjacent highway cell is reachable.
+        """
+        tr, tc = target_rc  # (row, col)
+        rows, cols = self.grid_size
+        adjacent = [
+            (tr - 1, tc), (tr + 1, tc), (tr, tc - 1), (tr, tc + 1)
+        ]
+        entries = [
+            (r, c) for (r, c) in adjacent
+            if 0 <= r < rows and 0 <= c < cols
+            and self.highways[r, c] == 1
+            and (c, r) not in self.goals   # not a goal slot
+        ]
+        best_path: List[Tuple[int, int]] = []
+        for entry_rc in entries:
+            p = self.find_agv_path(start, entry_rc, agent, care_for_agents)
+            if p and (not best_path or len(p) < len(best_path)):
+                best_path = p
+        return best_path
+
+    def find_agv_path_to_goal_entry(self, start: Tuple[int, int], goal_xy: Tuple[int, int],
+                                    agent: "Agent", care_for_agents: bool = True) -> List[Tuple[int, int]]:
+        """Route an AGV to the nearest highway cell adjacent to goal_xy (col, row).
+
+        Used for side drop-off: the AGV stops at a highway cell next to the
+        pickerwall slot and deposits the shelf sideways.  start is (row, col).
+        Returns [] when no entry cell is reachable.
+        """
+        entries = self._goal_to_agv_entry.get(goal_xy, [])
+        best_path: List[Tuple[int, int]] = []
+        for (ex, ey) in entries:          # entries stored as (col, row)
+            p = self.find_agv_path(start, (ey, ex), agent, care_for_agents)
+            if p and (not best_path or len(p) < len(best_path)):
+                best_path = p
+        return best_path
 
     def find_picker_path(self, start, goal: Tuple[int, int], picker: "Picker", care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for a picker on picker_highways. Returns [] if no path exists."""
@@ -488,7 +590,37 @@ class Warehouse(gym.Env):
             if not agent.busy:
                 agent.target = 0
                 if macro_action != 0:
-                    agent.path = self.find_agv_path((agent.y, agent.x), self.action_id_to_coords_map[macro_action], agent, care_for_agents=True)
+                    target_rc = self.action_id_to_coords_map[macro_action]  # (row, col)
+                    target_xy = (target_rc[1], target_rc[0])                # (col, row)
+
+                    if target_xy in self.goals:
+                        # Pickerwall target (pick-up or drop-off): approach from adjacent
+                        # highway cell so the AGV never enters the tile-2 slot.
+                        agent.path = self.find_agv_path_to_goal_entry(
+                            (agent.y, agent.x), target_xy, agent, care_for_agents=True
+                        )
+                        if not agent.path:
+                            agent.path = self.find_agv_path_to_goal_entry(
+                                (agent.y, agent.x), target_xy, agent, care_for_agents=False
+                            )
+                    elif not self._is_highway(target_rc[1], target_rc[0]):
+                        # Non-highway target (shelf tile): approach from an adjacent
+                        # highway cell so the AGV never enters the shelf cell directly.
+                        agent.path = self.find_agv_path_to_target_entry(
+                            (agent.y, agent.x), target_rc, agent, care_for_agents=True
+                        )
+                        if not agent.path:
+                            agent.path = self.find_agv_path_to_target_entry(
+                                (agent.y, agent.x), target_rc, agent, care_for_agents=False
+                            )
+                    else:
+                        agent.path = self.find_agv_path((agent.y, agent.x), target_rc, agent, care_for_agents=True)
+                        if not agent.path:
+                            # Congestion blocked the agent-aware path; fall back to ignoring agents
+                            # so the agent can at least start moving. resolve_move_conflict handles
+                            # any resulting step-level collisions.
+                            agent.path = self.find_agv_path((agent.y, agent.x), target_rc, agent, care_for_agents=False)
+
                     if agent.path:
                         agent.busy = True
                         agent.target = macro_action
@@ -496,16 +628,41 @@ class Warehouse(gym.Env):
                         self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
             else:
                 if agent.path == []:
-                    agent.req_action = Action.TOGGLE_LOAD
+                    # Before issuing TOGGLE_LOAD, ensure the agent faces the target cell
+                    # so the visual representation is correct.
+                    target_rc = self.action_id_to_coords_map.get(agent.target)
+                    required_dir = None
+                    if target_rc is not None:
+                        tx, ty = target_rc[1], target_rc[0]   # (col, row)
+                        dx, dy = tx - agent.x, ty - agent.y
+                        if (abs(dx) + abs(dy)) == 1:
+                            dir_map = {
+                                (0, -1): Direction.UP,
+                                (0, 1):  Direction.DOWN,
+                                (-1, 0): Direction.LEFT,
+                                (1, 0):  Direction.RIGHT,
+                            }
+                            required_dir = dir_map.get((dx, dy))
+                    if required_dir is not None and agent.dir != required_dir:
+                        # Issue a single rotation step so the agent faces the target,
+                        # then TOGGLE_LOAD will fire on the next step.
+                        turn_order = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+                        diff = (turn_order.index(required_dir) - turn_order.index(agent.dir)) % 4
+                        agent.req_action = Action.RIGHT if diff <= 2 else Action.LEFT
+                    else:
+                        agent.req_action = Action.TOGGLE_LOAD
                 else:
                     agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
                     agvs_distance_travelled += 1
-                if len(agent.path) == 1:
-                    # If carrying and the target cell is already occupied by a resting shelf, abort
-                    if agent.carrying_shelf and self.grid[CollisionLayers.SHELVES, agent.path[-1][1], agent.path[-1][0]]:
-                        # target cell occupied by a resting shelf - abort
-                        agent.req_action = Action.NOOP
-                        agent.busy = False
+                if len(agent.path) == 1 and agent.carrying_shelf:
+                    # If the deposit target is already occupied by a resting shelf, abort.
+                    # The deposit target is the action target cell, not the entry cell.
+                    target_rc = self.action_id_to_coords_map.get(agent.target)
+                    if target_rc is not None:
+                        tx, ty = target_rc[1], target_rc[0]
+                        if self.grid[CollisionLayers.SHELVES, ty, tx]:
+                            agent.req_action = Action.NOOP
+                            agent.busy = False
         return agvs_distance_travelled
 
     def resolve_move_conflict(self, agent_list):
@@ -543,11 +700,15 @@ class Warehouse(gym.Env):
                     if agent.path and ((agent_new_x, agent_new_y) in [(other.x, other.y), (other_new_x, other_new_y)]):
                         if (agent_new_x, agent_new_y) == (other.x, other.y):
                             agent.req_action = Action.NOOP
-                            if (other_new_x, other_new_y) in [(agent.x, agent.y), (agent_new_x, agent_new_y)] and not other.req_action in (Action.LEFT, Action.RIGHT):
+                            if (other_new_x, other_new_y) in [(agent.x, agent.y), (agent_new_x, agent_new_y)] and other.req_action not in (Action.LEFT, Action.RIGHT):
                                 if other.fixing_clash == 0:
                                     clashes+=1
                                     agent.fixing_clash = _FIXING_CLASH_TIME
-                                    new_path = self.find_agv_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent)
+                                    new_path = self.find_agv_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent, True)
+                                    if len(new_path) == 1:
+                                        # Agents that are stuck and are 1 cell away from their target are likely competing with an AGV that has
+                                        # the same dilemma, so, re-route agent to the target through an adjacent cell to the target.
+                                        new_path = self.find_agv_path_through_adjacent_loc((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent, True)
                                     if new_path != []:
                                         agent.path = new_path
                                     else:
@@ -614,26 +775,12 @@ class Warehouse(gym.Env):
             for agent in self.agents
             if agent.busy
             and agent.req_action not in (Action.LEFT, Action.RIGHT) # Don't count changing directions
-            and (agent.req_action!=Action.TOGGLE_LOAD or (agent.x, agent.y) in self.goals) # Don't count loading or changing directions / if at goal
+            and (agent.req_action!=Action.TOGGLE_LOAD or (agent.x, agent.y) in self.goals or (agent.x, agent.y) in self._agv_entry_to_goal) # Don't count loading at goal or entry cell
         ]
         for agent in moving_agents:
             agent_stuck_count = self.stuck_counters[agent.id - 1]
             agent_stuck_count.update((agent.x, agent.y))
             if _STUCK_THRESHOLD < agent_stuck_count.count < _STUCK_THRESHOLD + self.column_height + 2:  # Time to get out of aisle
-                agent.req_action = Action.NOOP
-                if agent.path:
-                    new_path = self.find_agv_path((agent.y, agent.x), (agent.path[-1][1], agent.path[-1][0]), agent)
-                    if new_path:
-                        agent.path = new_path
-                        if len(agent.path) == 1:
-                            continue
-                        agent_stuck_count.reset((agent.x, agent.y))
-                        continue
-                else:
-                    overall_stucks += 1
-                    agent.busy = False
-                    agent_stuck_count.reset()
-            if agent_stuck_count.count > _STUCK_THRESHOLD + self.column_height + 2:  # Time to get out of aisle
                 overall_stucks += 1
                 agent_stuck_count.reset((agent.x, agent.y))
                 agent.req_action = Action.NOOP
@@ -650,10 +797,20 @@ class Warehouse(gym.Env):
         agent.dir = agent.req_direction()
 
     def _execute_load(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        shelf_id = self.grid[CollisionLayers.SHELVES, agent.y, agent.x]
+        # Determine which cell the shelf is in.  If the agent is adjacent to its
+        # target (side pick-up from shelf rack or pickerwall), look there;
+        # otherwise fall back to the agent's own cell (legacy / replenishment).
+        load_x, load_y = agent.x, agent.y
+        target_rc = self.action_id_to_coords_map.get(agent.target)
+        if target_rc is not None:
+            tx, ty = target_rc[1], target_rc[0]  # (col, row)
+            if abs(tx - agent.x) + abs(ty - agent.y) == 1:
+                load_x, load_y = tx, ty
+
+        shelf_id = self.grid[CollisionLayers.SHELVES, load_y, load_x]
         if shelf_id:
             agent.carrying_shelf = self.shelfs[shelf_id - 1]
-            self.grid[CollisionLayers.SHELVES, agent.y, agent.x] = 0
+            self.grid[CollisionLayers.SHELVES, load_y, load_x] = 0
             self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = shelf_id
             agent.busy = False
             if self.reward_type == RewardType.GLOBAL:
@@ -664,7 +821,140 @@ class Warehouse(gym.Env):
             agent.busy = False
         return rewards
 
+    def _deliver_to_pickerwall(self, agent: Agent, gx: int, gy: int,
+                               rewards: np.ndarray[int]) -> np.ndarray[int]:
+        """Place the shelf carried by *agent* into pickerwall slot (gx, gy) and
+        update the request queue and picker-wall pending list.  The agent must
+        already be at its final cell (entry or goal) when this is called."""
+        shelf = agent.carrying_shelf
+        self.grid[CollisionLayers.SHELVES, gy, gx] = shelf.id
+        self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
+        shelf.x, shelf.y = gx, gy
+        agent.carrying_shelf = None
+        agent.busy = False
+        agent.has_delivered = False
+
+        if shelf not in self.request_queue:
+            return rewards
+
+        if self.reward_type == RewardType.GLOBAL:
+            rewards += 1
+        elif self.reward_type == RewardType.INDIVIDUAL:
+            rewards[agent.id - 1] += 1
+
+        carried_shelves = {a.carrying_shelf for a in self.agents if a.carrying_shelf}
+        pickerwall_shelf_ids = {
+            self.grid[CollisionLayers.SHELVES, yy, xx]
+            for (xx, yy) in self.goals
+            if self.grid[CollisionLayers.SHELVES, yy, xx] != 0
+        }
+        pickerwall_shelves = {self.shelfs[sid - 1] for sid in pickerwall_shelf_ids}
+        new_shelf_candidates = [
+            s for s in self.shelfs
+            if s.on_grid
+            and s not in self.request_queue
+            and s not in carried_shelves
+            and s not in pickerwall_shelves
+        ]
+        new_shelf_candidates.sort(key=lambda s: s.id)
+        delivered_order = self._shelf_to_order.pop(shelf.id, None)
+        if delivered_order is not None:
+            matched_sku_entry = next(
+                (se for se in delivered_order.skus if se.sku == shelf.sku), None
+            )
+            if matched_sku_entry is not None and self.num_pickers > 0:
+                self._pickerwall_pending.append((shelf.id, matched_sku_entry, delivered_order))
+            logger.info(
+                "step=%d delivery: shelf_id=%d sku=%d arrived for order=%s "
+                "(pickerwall_pending=%d)",
+                self._cur_steps, shelf.id, shelf.sku, delivered_order.order_number,
+                len(self._pickerwall_pending),
+            )
+
+        result = self.order_sequencer.next_order_shelf(new_shelf_candidates)
+        if result is not None:
+            new_request, new_order = result
+            self._shelf_to_order[new_request.id] = new_order
+            logger.info(
+                "step=%d delivery: shelf_id=%d sku=%s delivered - "
+                "replaced in queue with shelf_id=%d sku=%d "
+                "(pending=%d active=%d)",
+                self._cur_steps, shelf.id, shelf.sku,
+                new_request.id, new_request.sku,
+                self.order_sequencer.pending_count, self.order_sequencer.active_count,
+            )
+        else:
+            new_request = None
+            logger.info(
+                "step=%d delivery: shelf_id=%d sku=%s delivered - "
+                "no active orders available, queue shrinks to %d "
+                "(pending=%d active=%d)",
+                self._cur_steps, shelf.id, shelf.sku,
+                len(self.request_queue) - 1,
+                self.order_sequencer.pending_count, self.order_sequencer.active_count,
+            )
+
+        if new_request is not None:
+            self.request_queue[self.request_queue.index(shelf)] = new_request
+        else:
+            self.request_queue.remove(shelf)
+        self._step_deliveries += 1
+        return rewards
+
+    def _deposit_to_shelf_cell(self, agent: Agent, sx: int, sy: int,
+                               rewards: np.ndarray[int]) -> np.ndarray[int]:
+        """Place the shelf carried by *agent* into rack slot (sx, sy) and
+        clear the CARRIED_SHELVES layer at the agent's current cell."""
+        shelf = agent.carrying_shelf
+        if shelf.depleted:
+            shelf.on_grid = False
+            self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
+            agent.carrying_shelf = None
+            agent.busy = False
+            agent.has_delivered = False
+            logger.info(
+                "step=%d: depleted shelf_id=%d sku=%d removed from warehouse",
+                self._cur_steps, shelf.id, shelf.sku,
+            )
+        else:
+            self.grid[CollisionLayers.SHELVES, sy, sx] = shelf.id
+            self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
+            shelf.x, shelf.y = sx, sy
+            agent.carrying_shelf = None
+            agent.busy = False
+            agent.has_delivered = False
+            if self.reward_type == RewardType.GLOBAL:
+                rewards += 0.5
+            elif self.reward_type == RewardType.INDIVIDUAL:
+                rewards[agent.id - 1] += 0.1
+        return rewards
+
     def _execute_unload(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
+        # Side drop-off to pickerwall: AGV is at a highway entry cell adjacent to a goal.
+        goal_xy = self._agv_entry_to_goal.get((agent.x, agent.y))
+        if goal_xy is not None:
+            gx, gy = goal_xy
+            if self.grid[CollisionLayers.SHELVES, gy, gx] != 0:
+                # Goal slot still occupied; can't deposit yet
+                agent.busy = False
+                return rewards
+            return self._deliver_to_pickerwall(agent, gx, gy, rewards)
+
+        # Side deposit to rack: AGV is on a highway cell adjacent to its target shelf slot.
+        target_rc = self.action_id_to_coords_map.get(agent.target)
+        if target_rc is not None:
+            tx, ty = target_rc[1], target_rc[0]   # (col, row) of the rack slot
+            if (abs(tx - agent.x) + abs(ty - agent.y) == 1
+                    and not self._is_highway(tx, ty)
+                    and (tx, ty) not in self.goals):
+                if self.grid[CollisionLayers.SHELVES, ty, tx] != 0:
+                    # Rack slot occupied; can't deposit
+                    agent.busy = False
+                    return rewards
+                return self._deposit_to_shelf_cell(agent, tx, ty, rewards)
+
+        # Legacy / fallback: agent is at the target cell itself.
+
         # Can't deposit if another shelf is already sitting at this cell
         if self.grid[CollisionLayers.SHELVES, agent.y, agent.x] != 0:
             agent.busy = False
@@ -676,108 +966,11 @@ class Warehouse(gym.Env):
             return rewards
 
         if (agent.x, agent.y) in self.goals:
-            # Deposit shelf at pickerwall slot
-            shelf = agent.carrying_shelf
-            self.grid[CollisionLayers.SHELVES, agent.y, agent.x] = shelf.id
-            self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-            shelf.x, shelf.y = agent.x, agent.y
-            agent.carrying_shelf = None
-            agent.busy = False
-            agent.has_delivered = False
-            if shelf in self.request_queue:
-                if self.reward_type == RewardType.GLOBAL:
-                    rewards += 1
-                elif self.reward_type == RewardType.INDIVIDUAL:
-                    rewards[agent.id - 1] += 1
-                carried_shelves = {a.carrying_shelf for a in self.agents if a.carrying_shelf}
-                pickerwall_shelf_ids = {
-                    self.grid[CollisionLayers.SHELVES, yy, xx]
-                    for (xx, yy) in self.goals
-                    if self.grid[CollisionLayers.SHELVES, yy, xx] != 0
-                }
-                pickerwall_shelves = {self.shelfs[sid - 1] for sid in pickerwall_shelf_ids}
-                new_shelf_candidates = [
-                    s for s in self.shelfs
-                    if s.on_grid
-                    and s not in self.request_queue
-                    and s not in carried_shelves
-                    and s not in pickerwall_shelves
-                ]
-                new_shelf_candidates.sort(key=lambda s: s.id)
-                delivered_order = self._shelf_to_order.pop(shelf.id, None)
-                if delivered_order is not None:
-                    matched_sku_entry = next(
-                        (se for se in delivered_order.skus if se.sku == shelf.sku), None
-                    )
-                    if matched_sku_entry is not None and self.num_pickers > 0:
-                        self._pickerwall_pending.append((shelf.id, matched_sku_entry, delivered_order))
-                    logger.info(
-                        "step=%d delivery: shelf_id=%d sku=%d arrived for order=%s "
-                        "(pickerwall_pending=%d)",
-                        self._cur_steps, shelf.id, shelf.sku, delivered_order.order_number,
-                        len(self._pickerwall_pending),
-                    )
-
-                result = self.order_sequencer.next_order_shelf(new_shelf_candidates)
-                if result is not None:
-                    new_request, new_order = result
-                    self._shelf_to_order[new_request.id] = new_order
-                    logger.info(
-                        "step=%d delivery: shelf_id=%d sku=%s delivered - "
-                        "replaced in queue with shelf_id=%d sku=%d "
-                        "(pending=%d active=%d)",
-                        self._cur_steps,
-                        shelf.id,
-                        shelf.sku,
-                        new_request.id,
-                        new_request.sku,
-                        self.order_sequencer.pending_count,
-                        self.order_sequencer.active_count,
-                    )
-                else:
-                    new_request = None
-                    logger.info(
-                        "step=%d delivery: shelf_id=%d sku=%s delivered - "
-                        "no active orders available, queue shrinks to %d "
-                        "(pending=%d active=%d)",
-                        self._cur_steps,
-                        shelf.id,
-                        shelf.sku,
-                        len(self.request_queue) - 1,
-                        self.order_sequencer.pending_count,
-                        self.order_sequencer.active_count,
-                    )
-
-                if new_request is not None:
-                    self.request_queue[self.request_queue.index(shelf)] = new_request
-                else:
-                    self.request_queue.remove(shelf)
-                self._step_deliveries += 1
-            return rewards
+            return self._deliver_to_pickerwall(agent, agent.x, agent.y, rewards)
 
         if not self._is_highway(agent.x, agent.y):
-            shelf = agent.carrying_shelf
-            if shelf.depleted:
-                shelf.on_grid = False
-                self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-                agent.carrying_shelf = None
-                agent.busy = False
-                agent.has_delivered = False
-                logger.info(
-                    "step=%d: depleted shelf_id=%d sku=%d removed from warehouse",
-                    self._cur_steps, shelf.id, shelf.sku,
-                )
-            else:
-                self.grid[CollisionLayers.SHELVES, agent.y, agent.x] = shelf.id
-                self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-                shelf.x, shelf.y = agent.x, agent.y
-                agent.carrying_shelf = None
-                agent.busy = False
-                agent.has_delivered = False
-                if self.reward_type == RewardType.GLOBAL:
-                    rewards += 0.5
-                elif self.reward_type == RewardType.INDIVIDUAL:
-                    rewards[agent.id - 1] += 0.1
+            return self._deposit_to_shelf_cell(agent, agent.x, agent.y, rewards)
+
         return rewards
 
     def execute_micro_actions(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
@@ -1172,6 +1365,9 @@ class Warehouse(gym.Env):
         """Drive all picker agents through their state machine each step."""
         for picker in self.pickers:
 
+            if picker.fixing_clash > 0:
+                picker.fixing_clash -= 1
+
             # IDLE
             if picker.state == PickerState.IDLE:
                 claims = self._claim_items_for_picker(picker)
@@ -1195,9 +1391,28 @@ class Warehouse(gym.Env):
                 if picker.path:
                     next_xy = picker.path[0]  # (col, row) = (x, y)
                     if self._picker_next_cell_blocked(picker, next_xy):
+                        picker.blocked_ticks += 1
+                        if picker.blocked_ticks >= _PICKER_BLOCKED_REROUTE_THRESHOLD and len(picker.path) > 1:
+                            blocking_picker = next(
+                                (p for p in self.pickers if p is not picker and (p.x, p.y) == next_xy), None
+                            )
+                            if blocking_picker is None or blocking_picker.fixing_clash == 0:
+                                dest_col, dest_row = picker.path[-1]
+                                new_path = self.find_picker_path(
+                                    (picker.y, picker.x), (dest_row, dest_col), picker, care_for_agents=True
+                                )
+                                if new_path:
+                                    logger.debug(
+                                        "step=%d picker_id=%d: deadlock detour after %d blocked steps",
+                                        self._cur_steps, picker.id, picker.blocked_ticks,
+                                    )
+                                    picker.path = new_path
+                                    picker.fixing_clash = _FIXING_CLASH_TIME
+                                picker.blocked_ticks = 0
                         continue
                     picker.x, picker.y = next_xy[0], next_xy[1]
                     picker.path = picker.path[1:]
+                    picker.blocked_ticks = 0
                 else:
                     picker.state = PickerState.PICKING
                     picker.pick_ticks_remaining = _PICK_TICKS
@@ -1239,9 +1454,28 @@ class Warehouse(gym.Env):
                 if picker.path:
                     next_xy = picker.path[0]
                     if self._picker_next_cell_blocked(picker, next_xy):
+                        picker.blocked_ticks += 1
+                        if picker.blocked_ticks >= _PICKER_BLOCKED_REROUTE_THRESHOLD and len(picker.path) > 1:
+                            blocking_picker = next(
+                                (p for p in self.pickers if p is not picker and (p.x, p.y) == next_xy), None
+                            )
+                            if blocking_picker is None or blocking_picker.fixing_clash == 0:
+                                dest_col, dest_row = picker.path[-1]
+                                new_path = self.find_picker_path(
+                                    (picker.y, picker.x), (dest_row, dest_col), picker, care_for_agents=True
+                                )
+                                if new_path:
+                                    logger.debug(
+                                        "step=%d picker_id=%d: deadlock detour after %d blocked steps (packaging)",
+                                        self._cur_steps, picker.id, picker.blocked_ticks,
+                                    )
+                                    picker.path = new_path
+                                    picker.fixing_clash = _FIXING_CLASH_TIME
+                                picker.blocked_ticks = 0
                         continue
                     picker.x, picker.y = next_xy[0], next_xy[1]
                     picker.path = picker.path[1:]
+                    picker.blocked_ticks = 0
                 else:
                     picker.state = PickerState.AT_PACKAGING
                     logger.info(

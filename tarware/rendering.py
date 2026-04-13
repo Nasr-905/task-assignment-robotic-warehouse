@@ -66,7 +66,8 @@ _SHELF_FULFILLED_COLOR = (0, 160, 80)   # green: pickerwall shelf fully picked, 
 _CARRIER_COLOR = _MAROON
 _LOADER_AGENT = _BLUE
 
-_PICKER_ZONE_COLOR = (200, 230, 255)   # light blue background for picker zone
+_SHELF_LOC_COLOR = (200, 200, 200)    # light gray for shelf location markers
+_PICKER_ZONE_COLOR = (170, 230, 255)   # light blue background for picker zone
 _SHARED_HIGHWAY_COLOR = (205, 235, 205)  # green-blue tint: shared AGV/picker aisle
 _REPLENISHMENT_ZONE_COLOR = (220, 255, 220)  # light green background for replenishment zone
 _REPLENISHMENT_SHELF_COLOR = (50, 200, 50)   # bright green: fresh stock shelf in replenishment zone
@@ -130,6 +131,7 @@ class Viewer(object):
         self.window.dispatch_events()
 
         self._draw_grid()
+        self._draw_shelf_locs(env)
         self._draw_picker_zone(env)
         self._draw_shared_highways(env)
         self._draw_replenishment_zone(env)
@@ -184,6 +186,25 @@ class Viewer(object):
                     ),
                 ),
                 ("c3B", (*_GRID_COLOR, *_GRID_COLOR)),
+            )
+        batch.draw()
+
+    def _draw_shelf_locs(self, env):
+        if not hasattr(env, "shelf_locs") or not env.shelf_locs:
+            return
+        batch = pyglet.graphics.Batch()
+        gs = self.grid_size + 1
+        for row, col in env.shelf_locs:
+            y = self.rows - row - 1
+            batch.add(
+                4, gl.GL_QUADS, None,
+                ("v2f", (
+                    gs * col + 1,        gs * y + 1,
+                    gs * (col + 1),      gs * y + 1,
+                    gs * (col + 1),      gs * (y + 1),
+                    gs * col + 1,        gs * (y + 1),
+                )),
+                ("c3B", 4 * _SHELF_LOC_COLOR),
             )
         batch.draw()
 
@@ -280,13 +301,15 @@ class Viewer(object):
         batch.draw()
 
     def _draw_picker_zone(self, env):
-        if not hasattr(env, "agv_zone_height") or env.agv_zone_height >= env.grid_size[0]:
+        if not hasattr(env, "picker_highways") or not env.picker_highways.any():
             return
         batch = pyglet.graphics.Batch()
         gs = self.grid_size + 1
-        for row in range(env.agv_zone_height, env.grid_size[0]):
+        for row in range(env.grid_size[0]):
             y = self.rows - row - 1  # pyglet reversed
             for col in range(env.grid_size[1]):
+                if env.picker_highways[row, col] != 1:
+                    continue
                 batch.add(
                     4, gl.GL_QUADS, None,
                     ("v2f", (

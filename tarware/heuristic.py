@@ -24,7 +24,7 @@ class Mission:
     at_location: bool = False
 
 
-def heuristic_episode(env, render=False, seed=None, render_start=500, render_sleep=0.0):
+def heuristic_episode(env, render=False, seed=None, render_start=0, render_sleep=0.0):
     # non_goal_location_ids aligns with the index ordering of get_empty_shelf_information
     non_goal_location_ids = []
     for id_, coords in env.action_id_to_coords_map.items():
@@ -55,8 +55,18 @@ def heuristic_episode(env, render=False, seed=None, render_start=500, render_sle
         for agv in agvs:
             if agv in assigned_agvs:
                 m = assigned_agvs[agv]
-                if agv.x == m.location_x and agv.y == m.location_y:
-                    assigned_agvs[agv].at_location = True
+                if m.mission_type == MissionType.DELIVERING:
+                    # DELIVERING: AGV stops at an entry cell adjacent to the goal.
+                    goal_xy = (m.location_x, m.location_y)
+                    entry_cells = env._goal_to_agv_entry.get(goal_xy, [])
+                    if (agv.x, agv.y) in entry_cells:
+                        assigned_agvs[agv].at_location = True
+                else:
+                    # PICKING / RETURNING: AGV stops adjacent to its target cell.
+                    # Accept distance-1 (adjacent) or 0 (at same cell, fallback).
+                    dist = abs(agv.x - m.location_x) + abs(agv.y - m.location_y)
+                    if dist <= 1:
+                        assigned_agvs[agv].at_location = True
 
         # handle completed / transitioning missions
         for agv in agvs:
@@ -76,8 +86,9 @@ def heuristic_episode(env, render=False, seed=None, render_start=500, render_sle
                     empty_location_ids = [i for i in empty_location_ids if i not in busy_loc_ids]
                     if empty_location_ids:
                         empty_yx = [location_map[i] for i in empty_location_ids]
-                        dists = [len(env.find_agv_path((agv.y, agv.x), yx, agv, care_for_agents=False))
-                                 for yx in empty_yx]
+                        dists = [len(p) if p else float('inf')
+                                 for p in (env.find_agv_path((agv.y, agv.x), yx, agv, care_for_agents=False)
+                                           for yx in empty_yx)]
                         best_id = empty_location_ids[np.argmin(dists)]
                         best_yx = location_map[best_id]
                         assigned_agvs.pop(agv)
@@ -95,14 +106,19 @@ def heuristic_episode(env, render=False, seed=None, render_start=500, render_sle
                     available_goals = [g for g in available_goals if g not in busy_goal_xys]
 
                     if available_goals:
+                        # Route to AGV-entry cells adjacent to each goal for accurate distances.
                         goal_paths = [
-                            env.find_agv_path((agv.y, agv.x), (y, x), agv, care_for_agents=False)
+                            env.find_agv_path_to_goal_entry(
+                                (agv.y, agv.x), (x, y), agv, care_for_agents=False
+                            )
                             for (x, y) in available_goals
                         ]
-                        goal_dists = [len(p) for p in goal_paths]
-                        closest = available_goals[np.argmin(goal_dists)]  # (x, y)
+                        goal_dists = [len(p) if p else float('inf') for p in goal_paths]
+                        closest = available_goals[np.argmin(goal_dists)]  # (x, y) of goal
                         goal_id = coords_original_loc_map[(closest[1], closest[0])]
                         assigned_agvs.pop(agv)
+                        # location_x/y stored as the goal (col, row) so at_location can look
+                        # up the correct entry cells via env._goal_to_agv_entry.
                         assigned_agvs[agv] = Mission(MissionType.DELIVERING, goal_id,
                                                      closest[0], closest[1], timestep)
                     # if no slot free, AGV waits; displacement will clear one
@@ -139,10 +155,12 @@ def heuristic_episode(env, render=False, seed=None, render_start=500, render_sle
                     break
                 if effective_occupied / env.num_goals < DISPLACEMENT_THRESHOLD:
                     break
-                agv_paths = [env.find_agv_path((a.y, a.x), (goal_xy[1], goal_xy[0]), a,
-                                           care_for_agents=False)
+                agv_paths = [env.find_agv_path_to_goal_entry(
+                                (a.y, a.x), goal_xy, a, care_for_agents=False)
                              for a in free_agvs]
-                agv_dists = [len(p) for p in agv_paths]
+                agv_dists = [len(p) if p else float('inf') for p in agv_paths]
+                if all(d == float('inf') for d in agv_dists):
+                    break  # no AGV can reach this displacement goal; skip
                 chosen = free_agvs[np.argmin(agv_dists)]
                 goal_id = coords_original_loc_map[(goal_xy[1], goal_xy[0])]
                 assigned_agvs[chosen] = Mission(MissionType.PICKING, goal_id,
@@ -162,7 +180,9 @@ def heuristic_episode(env, render=False, seed=None, render_start=500, render_sle
 
             agv_paths = [env.find_agv_path((a.y, a.x), (item.y, item.x), a, care_for_agents=False)
                          for a in available_agvs]
-            agv_dists = [len(p) for p in agv_paths]
+            agv_dists = [len(p) if p else float('inf') for p in agv_paths]
+            if all(d == float('inf') for d in agv_dists):
+                continue  # no AGV can reach this item; try next
             closest_agv = available_agvs[np.argmin(agv_dists)]
             item_location_id = coords_original_loc_map[(item.y, item.x)]
             assigned_agvs[closest_agv] = Mission(MissionType.PICKING, item_location_id,
@@ -178,6 +198,7 @@ def heuristic_episode(env, render=False, seed=None, render_start=500, render_sle
         global_episode_return += np.sum(reward)
         done = all(done)
         all_infos.append(info)
+
         if render and timestep >= render_start:
             env.render(mode="human")
             if render_sleep:
