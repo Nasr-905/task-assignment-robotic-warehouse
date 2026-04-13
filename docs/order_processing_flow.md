@@ -9,14 +9,14 @@ flowchart TD
 
     B --> C[Order objects<br/>order_number, date, time, type, skus]
     B --> D[SKUEntry objects<br/>sku, quantity]
-    B --> E[_pending<br/>List[Order], sorted by creation time]
+    B --> E[_pending<br/>List of Order, sorted by creation time]
     B --> F[_unique_skus<br/>SKU frequency order]
 
     G[Warehouse.reset] --> H[Create Shelf objects<br/>from map shelf_locs]
     H --> I[initialize_shelf_sku_map]
     F --> I
     I --> J[Shelf.sku assigned]
-    I --> K[_sku_to_shelves<br/>Dict sku -> List[Shelf]]
+    I --> K[_sku_to_shelves<br/>Dict sku to List of Shelf]
 
     G --> L[release_pending_orders step 0]
     E --> L
@@ -25,7 +25,7 @@ flowchart TD
 
     N --> O[next_order_shelf candidates]
     K --> O
-    O --> P[Warehouse.request_queue<br/>List[Shelf] requested by active orders]
+    O --> P[Warehouse.request_queue<br/>List of Shelf requested by active orders]
     O --> Q[_shelf_to_order<br/>shelf_id -> Order]
 
     P --> R[heuristic_episode]
