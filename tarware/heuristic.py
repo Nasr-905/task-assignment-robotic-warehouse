@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
+import time
 
 import numpy as np
 
@@ -23,7 +24,7 @@ class Mission:
     at_location: bool = False
 
 
-def heuristic_episode(env, render=False, seed=None):
+def heuristic_episode(env, render=False, seed=None, render_start=500, render_sleep=0.0):
     # non_goal_location_ids aligns with the index ordering of get_empty_shelf_information
     non_goal_location_ids = []
     for id_, coords in env.action_id_to_coords_map.items():
@@ -171,16 +172,16 @@ def heuristic_episode(env, render=False, seed=None):
         for agv, mission in assigned_agvs.items():
             actions[agv] = mission.location_id if not agv.busy else 0
 
-        if timestep > 500:
-            if render:
-                env.render(mode="human")
-
         _, reward, terminated, truncated, info = env.step(list(actions.values()))
         done = terminated or truncated
         episode_returns += np.array(reward, dtype=np.float64)
         global_episode_return += np.sum(reward)
         done = all(done)
         all_infos.append(info)
+        if render and timestep >= render_start:
+            env.render(mode="human")
+            if render_sleep:
+                time.sleep(render_sleep)
         timestep += 1
 
     return all_infos, global_episode_return, episode_returns

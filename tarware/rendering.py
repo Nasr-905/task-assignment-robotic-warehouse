@@ -67,6 +67,7 @@ _CARRIER_COLOR = _MAROON
 _LOADER_AGENT = _BLUE
 
 _PICKER_ZONE_COLOR = (200, 230, 255)   # light blue background for picker zone
+_SHARED_HIGHWAY_COLOR = (205, 235, 205)  # green-blue tint: shared AGV/picker aisle
 _REPLENISHMENT_ZONE_COLOR = (220, 255, 220)  # light green background for replenishment zone
 _REPLENISHMENT_SHELF_COLOR = (50, 200, 50)   # bright green: fresh stock shelf in replenishment zone
 _DEPLETED_SHELF_COLOR = (180, 60, 60)        # muted red: shelf with exhausted stock
@@ -101,8 +102,8 @@ class Viewer(object):
         display = get_display(None)
         self.rows, self.cols = world_size
 
-        self.grid_size = 30
-        self.icon_size = 20
+        self.grid_size = int(os.getenv("TARWARE_RENDER_TILE_SIZE", "30"))
+        self.icon_size = max(4, int(self.grid_size * 2 / 3))
 
         self.width = 1 + self.cols * (self.grid_size + 1)
         self.height = 1 + self.rows * (self.grid_size + 1)
@@ -130,6 +131,7 @@ class Viewer(object):
 
         self._draw_grid()
         self._draw_picker_zone(env)
+        self._draw_shared_highways(env)
         self._draw_replenishment_zone(env)
         self._draw_goals(env)
         self._draw_packaging(env)
@@ -295,6 +297,25 @@ class Viewer(object):
                     )),
                     ("c3B", 4 * _PICKER_ZONE_COLOR),
                 )
+        batch.draw()
+
+    def _draw_shared_highways(self, env):
+        if not hasattr(env, "shared_highway_locs") or not env.shared_highway_locs:
+            return
+        batch = pyglet.graphics.Batch()
+        gs = self.grid_size + 1
+        for col, row in env.shared_highway_locs:
+            y = self.rows - row - 1
+            batch.add(
+                4, gl.GL_QUADS, None,
+                ("v2f", (
+                    gs * col + 1,        gs * y + 1,
+                    gs * (col + 1),      gs * y + 1,
+                    gs * (col + 1),      gs * (y + 1),
+                    gs * col + 1,        gs * (y + 1),
+                )),
+                ("c3B", 4 * _SHARED_HIGHWAY_COLOR),
+            )
         batch.draw()
 
     def _draw_replenishment_zone(self, env):

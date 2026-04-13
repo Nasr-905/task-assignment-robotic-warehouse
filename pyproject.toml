@@ -21,14 +21,19 @@ classifiers=[
     ]
 dependencies = [
     "numpy",
+    "pandas",
     "gymnasium",
     "six==1.16.0",
     "pyglet==1.5.11",
     "networkx==3.2.1",
-    "pyastar2d @ external/pyastar2d_TARWARE",
-    "dotenv (>=0.9.9,<0.10.0)",
+    "pyastar2d",
+    "python-dotenv",
     "stable-baselines3 (>=2.7.1,<3.0.0)"
 ]
+
+[tool.setuptools.packages.find]
+include = ["tarware*"]
+exclude = ["data*", "docs*", "external*", "scripts*"]
 
 [project.optional-dependencies]
 test = ["pytest"]

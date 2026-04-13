@@ -12,12 +12,22 @@ Blank/missing cells are treated as `0`.
 | `2`   | PICKERWALL     | Goal slot — AGVs deposit shelves here for pickers        |
 | `3`   | PICKER_HIGHWAY | Picker walkable aisle (picker zone)                      |
 | `4`   | PACKAGING      | Packaging station — pickers walk here to complete orders |
+| `5`   | REPLENISHMENT  | AGV walkable staging location for fresh stock shelves    |
+| `6`   | SHARED_HIGHWAY | Shared AGV/picker aisle; AGVs yield to picker occupancy  |
+| `9`   | BLANK          | Unused blocked cell                                      |
 
 ## Zone rules
 
-- **AGV zone**: any row containing at least one tile of type `0`, `1`, or `2`.
-- **Picker zone**: rows whose tiles are all `3` or `4` (must be contiguous at the bottom).
+- **AGV zone**: any row containing at least one AGV-side tile:
+  `0`, `1`, `2`, `5`, or `6`.
+- **Picker zone**: any connected or embedded aisle made from picker-walkable
+  tiles `3`, `4`, or `6`. Older maps place this zone contiguously at the
+  bottom, but test layouts may put picker aisles around a middle pickerwall.
 - `num_pickers` is set at runtime (env parameter), not in the map file.
+- **Shared cells**: tile `6` is walkable by both AGVs and pickers.
+  Picker path planning ignores AGVs and avoids other pickers; AGVs plan around
+  both AGVs and pickers and yield/replan around picker current and next
+  positions at runtime.
 
 ## Files
 

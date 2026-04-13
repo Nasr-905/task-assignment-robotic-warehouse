@@ -113,7 +113,7 @@ static PyObject *astar(PyObject *self, PyObject *args) {
       if (nbrs[i] >= 0) {
         // the sum of the cost so far and the cost of this move
         float new_cost = costs[cur.idx] + weights[nbrs[i]];
-        if (cur.prev_dir > 0 and cur.prev_dir != i and weights[nbrs[i]] < 100) {
+        if (cur.prev_dir > 0 && cur.prev_dir != i && weights[nbrs[i]] < 100) {
           new_cost += 1;
         }
         if (new_cost < costs[nbrs[i]]) {

@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 _FIXING_CLASH_TIME = 4
 _STUCK_THRESHOLD = 5
 _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
+_AGV_WALKABLE_TILES = {0, 2, 5, 6}
+_PICKER_WALKABLE_TILES = {3, 4, 6}
+_SHARED_HIGHWAY_TILE = 6
 
 class Entity:
     def __init__(self, id_: int, x: int, y: int):
@@ -229,17 +232,17 @@ class Warehouse(gym.Env):
         """Build the warehouse layout from a CSV tile map.
 
         Tile encoding: 0=highway, 1=shelf/storage, 2=pickerwall, 3=picker_highway,
-        4=packaging, 5=replenishment (take-only), 9=blank.
+        4=packaging, 5=replenishment (take-only), 6=shared_highway, 9=blank.
         """
 
         df = pd.read_csv(map_csv_path, header=None).fillna(0)
         tile_grid = df.values.astype(int)  # shape (num_rows, num_cols)
         num_rows, num_cols = tile_grid.shape
 
-        # AGV zone ends at the last row containing tiles 0, 1, or 2
+        # AGV zone ends at the last row containing any AGV-side tile.
         agv_zone_height = num_rows
         for r in range(num_rows - 1, -1, -1):
-            if any(tile_grid[r, c] in (0, 1, 2) for c in range(num_cols)):
+            if any(tile_grid[r, c] in (0, 1, 2, 5, 6) for c in range(num_cols)):
                 agv_zone_height = r + 1
                 break
         picker_zone_rows = num_rows - agv_zone_height
@@ -248,16 +251,23 @@ class Warehouse(gym.Env):
         self.grid_size = (num_rows, num_cols)
         self.grid = np.zeros((len(CollisionLayers), *self.grid_size), dtype=np.int32)
 
-        # Highways: tiles 0 (open), 2 (pickerwall), and 5 (replenishment) are AGV-walkable.
+        # Highways: tile 6 is shared, so it is marked walkable for both groups.
         self.highways = np.zeros(self.grid_size, dtype=np.int32)
         self.picker_highways = np.zeros(self.grid_size, dtype=np.int32)
         for r in range(num_rows):
             for c in range(num_cols):
                 t = tile_grid[r, c]
-                if t in (0, 2, 5):
+                if t in _AGV_WALKABLE_TILES:
                     self.highways[r, c] = 1
-                elif t in (3, 4):
+                if t in _PICKER_WALKABLE_TILES:
                     self.picker_highways[r, c] = 1
+
+        self.shared_highway_locs: List[Tuple[int, int]] = [
+            (c, r)
+            for r in range(num_rows)
+            for c in range(num_cols)
+            if tile_grid[r, c] == _SHARED_HIGHWAY_TILE
+        ]
 
         # Goals (pickerwall), packaging locations (stored as (x, y) = (col, row))
         self.goals: List[Tuple[int, int]] = [
@@ -296,13 +306,14 @@ class Warehouse(gym.Env):
 
         self.agv_spawn_locs = np.argwhere(self.highways == 1)  # (row, col)
 
-        # Picker spawn cells exclude packaging stations
+        # Picker spawn cells exclude packaging stations. Picker aisles may be
+        # embedded in the map, not only in a contiguous bottom picker zone.
         self.picker_spawn_locs = np.array([
             (r, c)
             for r in range(num_rows)
             for c in range(num_cols)
             if self.picker_highways[r, c] == 1 and (c, r) not in packaging_set
-        ]) if picker_zone_rows > 0 else np.empty((0, 2), dtype=int)
+        ], dtype=int)
 
         # Per-goal picker entry points: picker_highway cells adjacent to each goal
         self._goal_to_picker_entry: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
@@ -477,7 +488,7 @@ class Warehouse(gym.Env):
             if not agent.busy:
                 agent.target = 0
                 if macro_action != 0:
-                    agent.path = self.find_agv_path((agent.y, agent.x), self.action_id_to_coords_map[macro_action], agent, care_for_agents=False)
+                    agent.path = self.find_agv_path((agent.y, agent.x), self.action_id_to_coords_map[macro_action], agent, care_for_agents=True)
                     if agent.path:
                         agent.busy = True
                         agent.target = macro_action
@@ -551,6 +562,50 @@ class Warehouse(gym.Env):
         for agent in failed_agents:
             agent.req_action = Action.NOOP
         return clashes
+
+    def _predict_picker_reserved_positions(self) -> set[Tuple[int, int]]:
+        """Cells AGVs should treat as picker-controlled for this step.
+
+        Pickers are modelled as less controllable than AGVs, so AGVs yield to
+        both current picker locations and the next cell on each picker path.
+        """
+        reserved = {(picker.x, picker.y) for picker in self.pickers}
+        for picker in self.pickers:
+            is_walking = picker.state in (
+                PickerState.WALKING_TO_SHELF,
+                PickerState.WALKING_TO_PACKAGING,
+            )
+            if is_walking and picker.path:
+                reserved.add(tuple(picker.path[0]))
+        return reserved
+
+    def _apply_picker_yield_to_agvs(self) -> int:
+        """Stop and replan AGVs whose next move conflicts with picker space."""
+        reserved = self._predict_picker_reserved_positions()
+        yields = 0
+        for agent in self.agents:
+            if agent.req_action != Action.FORWARD:
+                continue
+            next_xy = agent.req_location(self.grid_size)
+            if next_xy not in reserved:
+                continue
+
+            agent.req_action = Action.NOOP
+            yields += 1
+            if agent.fixing_clash == 0:
+                agent.fixing_clash = _FIXING_CLASH_TIME
+
+            if agent.path:
+                new_path = self.find_agv_path(
+                    (agent.y, agent.x),
+                    (agent.path[-1][1], agent.path[-1][0]),
+                    agent,
+                    care_for_agents=True,
+                )
+                if new_path:
+                    agent.path = new_path
+
+        return yields
 
     def resolve_stuck_agents(self) -> None:
         overall_stucks = 0
@@ -1019,7 +1074,7 @@ class Warehouse(gym.Env):
         )
         pkg_target = (closest_pkg[1], closest_pkg[0])  # (row, col) for find_picker_path
         picker.path = self.find_picker_path(
-            (picker.y, picker.x), pkg_target, picker, care_for_agents=False
+            (picker.y, picker.x), pkg_target, picker, care_for_agents=True
         )
         picker.state = PickerState.WALKING_TO_PACKAGING
         orders = list({c.order_number for c in picker.task.claims})
@@ -1085,7 +1140,7 @@ class Warehouse(gym.Env):
         entry_xy = min(entries, key=lambda e: abs(e[0] - picker.x) + abs(e[1] - picker.y))
         target = (entry_xy[1], entry_xy[0])  # (row, col) for find_picker_path
         picker.path = self.find_picker_path(
-            (picker.y, picker.x), target, picker, care_for_agents=False
+            (picker.y, picker.x), target, picker, care_for_agents=True
         )
         picker.state = PickerState.WALKING_TO_SHELF
         logger.info(
@@ -1093,6 +1148,25 @@ class Warehouse(gym.Env):
             self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku,
             entry_xy, len(picker.path),
         )
+
+    def _picker_next_cell_blocked(
+        self,
+        picker: "Picker",
+        next_xy: Tuple[int, int],
+    ) -> bool:
+        """Return True when a picker should wait before entering next_xy.
+
+        Picker routes intentionally ignore AGVs, but physical movement still
+        avoids stepping into an occupied cell. AGVs remain responsible for
+        yielding because they reserve picker current and next positions.
+        """
+        for other in self.pickers:
+            if other is not picker and (other.x, other.y) == next_xy:
+                return True
+        for agent in self.agents:
+            if (agent.x, agent.y) == next_xy:
+                return True
+        return False
 
     def _advance_pickers(self) -> None:
         """Drive all picker agents through their state machine each step."""
@@ -1120,6 +1194,8 @@ class Warehouse(gym.Env):
             elif picker.state == PickerState.WALKING_TO_SHELF:
                 if picker.path:
                     next_xy = picker.path[0]  # (col, row) = (x, y)
+                    if self._picker_next_cell_blocked(picker, next_xy):
+                        continue
                     picker.x, picker.y = next_xy[0], next_xy[1]
                     picker.path = picker.path[1:]
                 else:
@@ -1162,6 +1238,8 @@ class Warehouse(gym.Env):
             elif picker.state == PickerState.WALKING_TO_PACKAGING:
                 if picker.path:
                     next_xy = picker.path[0]
+                    if self._picker_next_cell_blocked(picker, next_xy):
+                        continue
                     picker.x, picker.y = next_xy[0], next_xy[1]
                     picker.path = picker.path[1:]
                 else:
@@ -1210,6 +1288,7 @@ class Warehouse(gym.Env):
 
         agvs_distance_travelled = self.attribute_macro_actions(macro_actions)
         clashes_count = self.resolve_move_conflict(self.agents)
+        picker_yields_count = self._apply_picker_yield_to_agvs()
         stucks_count = self.resolve_stuck_agents()
 
         rewards = np.zeros(self.num_agents)
@@ -1235,6 +1314,7 @@ class Warehouse(gym.Env):
         info = self._build_info(
             agvs_distance_travelled,
             clashes_count,
+            picker_yields_count,
             stucks_count,
             shelf_deliveries,
         )
@@ -1244,6 +1324,7 @@ class Warehouse(gym.Env):
         self,
         agvs_distance_travelled: int,
         clashes_count: int,
+        picker_yields_count: int,
         stucks_count: int,
         shelf_deliveries: int,
     ) -> Dict[str, np.ndarray]:
@@ -1252,6 +1333,7 @@ class Warehouse(gym.Env):
         info["vehicles_busy"] = [agent.busy for agent in self.agents]
         info["shelf_deliveries"] = shelf_deliveries
         info["clashes"] = clashes_count
+        info["picker_yields"] = picker_yields_count
         info["stucks"] = stucks_count
         info["agvs_distance_travelled"] = agvs_distance_travelled
         info["agvs_idle_time"] = agvs_idle_time
