@@ -42,6 +42,7 @@ class Order:
 class SKUEntry:
     sku: int
     quantity: int
+    unit_cube: float = 0.0
 
 
 class OrderSequencer:
@@ -72,7 +73,8 @@ class OrderSequencer:
             order = all_orders_dict[order_number]
             sku = int(row["SKU"])
             quantity = int(row["Shipped Quantity"])
-            order.skus.append(SKUEntry(sku=sku, quantity=quantity))
+            unit_cube = float(row.get("Unit cube F", 0.0) or 0.0)
+            order.skus.append(SKUEntry(sku=sku, quantity=quantity, unit_cube=unit_cube))
 
         all_orders = list(all_orders_dict.values())
         all_orders.sort(key=lambda o: (o.date_created, o.time_created_seconds))

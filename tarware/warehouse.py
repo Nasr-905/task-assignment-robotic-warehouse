@@ -1,5 +1,7 @@
 import logging
 from collections import deque
+import math
+import os
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -141,9 +143,9 @@ class PickerClaim:
 class PickerTask:
     """Capacity-limited batch of claims spanning potentially multiple orders.
 
-    Claims are ordered so that consecutive entries with the same ``shelf_id``
-    are serviced in a single pickerwall visit.  ``current_claim_index`` tracks
-    which claim the picker is currently working towards.
+    Claims are ordered by the simple picker policy, with same-shelf claims
+    grouped together. ``current_claim_index`` tracks which claim the picker is
+    currently working towards.
     """
     claims: List["PickerClaim"]
     current_claim_index: int = 0
@@ -165,6 +167,9 @@ class Picker(Entity):
         self.capacity: int = Picker.CAPACITY
         self.blocked_ticks: int = 0   # consecutive steps spent waiting on a blocked cell
         self.fixing_clash: int = 0    # cooldown after rerouting; mirrors Agent.fixing_clash
+        self.home_zone: Optional[int] = None
+        self.stalled: bool = False
+        self.packaging_location: Optional[Tuple[int, int]] = None
 
 
 class Warehouse(gym.Env):
@@ -200,6 +205,16 @@ class Warehouse(gym.Env):
         self._cur_inactive_steps = None
         self._cur_steps = 0
         self.max_steps = max_steps
+        self.picker_policy = os.getenv("TARWARE_PICKER_POLICY", "fifo").lower()
+        self.picker_zone_overflow = os.getenv("TARWARE_PICKER_ZONE_OVERFLOW", "adjacent").lower()
+        self.picker_stall_probability = float(os.getenv("TARWARE_PICKER_STALL_PROBABILITY", "0.0"))
+        self.use_sku_size_pick_time = os.getenv("TARWARE_PICKER_USE_SKU_SIZE_TIME", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.pick_base_ticks = int(os.getenv("TARWARE_PICK_BASE_TICKS", str(_PICK_TICKS)))
+        self.pick_unit_cube_tick_scale = float(os.getenv("TARWARE_PICK_UNIT_CUBE_TICK_SCALE", "1.0"))
 
         self.action_size = len(self.action_id_to_coords_map) + 1
         self.action_space = spaces.Tuple(tuple(self.num_agents * [spaces.Discrete(self.action_size)]))
@@ -223,7 +238,7 @@ class Warehouse(gym.Env):
         self.stuck_counters = []
         self.renderer = None
         self._shelf_to_order: Dict[int, Any] = {}  # shelf_id -> Order that triggered its fetch
-        self._packaging_slots: Dict[str, Dict[str, int]] = {}  # order_number -> {required, delivered}
+        self._packaging_slots: Dict[str, Dict[str, Any]] = {}  # order_number -> {required, delivered, station}
         self._pickerwall_pending: deque = deque()  # (shelf_id, SKUEntry, Order) populated on delivery
 
     @property
@@ -288,6 +303,7 @@ class Warehouse(gym.Env):
             if tile_grid[r, c] == 2
         ]
         self.num_goals = len(self.goals)
+        self._build_pickerwall_zones()
 
         self.packaging_locations: List[Tuple[int, int]] = [
             (c, r)
@@ -994,6 +1010,84 @@ class Warehouse(gym.Env):
             self._cur_inactive_steps += 1
         return rewards, shelf_deliveries
 
+    def _select_evenly_spaced_spawn_cells(
+        self,
+        candidates: List[Tuple[int, int]],
+        count: int,
+    ) -> List[Tuple[int, int]]:
+        """Choose deterministic spawn cells spread across the candidate list."""
+        if count <= 0 or not candidates:
+            return []
+        candidates = sorted(candidates)
+        if count >= len(candidates):
+            return candidates[:count]
+
+        chosen: List[Tuple[int, int]] = []
+        used_indices = set()
+        positions = np.linspace(0, len(candidates) - 1, count + 2)[1:-1]
+        for position in positions:
+            idx = int(round(position))
+            while idx in used_indices and idx + 1 < len(candidates):
+                idx += 1
+            while idx in used_indices and idx - 1 >= 0:
+                idx -= 1
+            if idx not in used_indices:
+                used_indices.add(idx)
+                chosen.append(candidates[idx])
+        return chosen
+
+    def _balanced_picker_spawn_specs(self) -> List[Tuple[int, int, Optional[int]]]:
+        """Return deterministic picker spawn specs as (row, col, home_zone)."""
+        all_candidates = [
+            (int(row), int(col))
+            for row, col in self.picker_spawn_locs
+        ]
+        if not all_candidates:
+            return []
+
+        if not self.pickerwall_zones:
+            cells = self._select_evenly_spaced_spawn_cells(
+                all_candidates,
+                min(self.num_pickers, len(all_candidates)),
+            )
+            return [(row, col, None) for row, col in cells]
+
+        zone_counts = [0 for _ in self.pickerwall_zones]
+        for picker_idx in range(self.num_pickers):
+            zone_counts[picker_idx % len(zone_counts)] += 1
+
+        used_cells = set()
+        specs: List[Tuple[int, int, Optional[int]]] = []
+        for zone_id, count in enumerate(zone_counts):
+            if count <= 0:
+                continue
+            zmin, zmax = self.pickerwall_zones[zone_id]
+            local_candidates = [
+                cell
+                for cell in all_candidates
+                if cell not in used_cells and zmin <= cell[0] <= zmax
+            ]
+            selected = self._select_evenly_spaced_spawn_cells(local_candidates, count)
+
+            if len(selected) < count:
+                fallback_candidates = [
+                    cell
+                    for cell in all_candidates
+                    if cell not in used_cells and cell not in selected
+                ]
+                selected.extend(
+                    self._select_evenly_spaced_spawn_cells(
+                        fallback_candidates,
+                        count - len(selected),
+                    )
+                )
+
+            for row, col in selected:
+                used_cells.add((row, col))
+                specs.append((row, col, zone_id))
+
+        return specs
+
     def reset(self, seed=None, options=None)-> Tuple:
         Shelf.counter = 0
         Agent.counter = 0
@@ -1020,18 +1114,21 @@ class Warehouse(gym.Env):
         Picker.counter = 0
         self.pickers = []
         if self.num_pickers > 0 and len(self.picker_spawn_locs) > 0:
-            picker_loc_ids = np.random.choice(len(self.picker_spawn_locs), size=self.num_pickers, replace=False)
-            picker_dirs = np.random.choice([d for d in Direction], size=self.num_pickers)
-            for loc_id, dir_ in zip(picker_loc_ids, picker_dirs):
-                py, px = self.picker_spawn_locs[loc_id]
-                picker = Picker(int(px), int(py), dir_)
+            picker_spawn_specs = self._balanced_picker_spawn_specs()
+            for py, px, home_zone in picker_spawn_specs:
+                picker = Picker(int(px), int(py), Direction.UP)
                 picker.state = PickerState.IDLE
                 picker.task = None
                 picker.path = []
                 picker.pick_ticks_remaining = 0
+                picker.home_zone = home_zone
+                picker.stalled = False
+                picker.packaging_location = None
                 self.pickers.append(picker)
-            logger.info("reset: spawned %d picker(s) across %d picker-highway cells",
-                        self.num_pickers, len(self.picker_spawn_locs))
+            logger.info(
+                "reset: spawned %d picker(s) evenly across %d zone(s) and %d picker-highway cells",
+                len(self.pickers), len(self.pickerwall_zones), len(self.picker_spawn_locs),
+            )
 
         self._recalc_grid()
 
@@ -1157,50 +1254,126 @@ class Warehouse(gym.Env):
                 return shelf_id
         return -1
 
-    def _claim_items_for_picker(self, picker: "Picker") -> List["PickerClaim"]:
-        """Claim up to picker.capacity item-units from _pickerwall_pending. Splits oversized entries in-place."""
-        if not self._pickerwall_pending:
-            return []
+    def _nearest_pickerwall_zone(self, row: int) -> Optional[int]:
+        if not self.pickerwall_zones:
+            return None
+        return min(
+            range(len(self.pickerwall_zones)),
+            key=lambda zone_id: abs(
+                row - (self.pickerwall_zones[zone_id][0] + self.pickerwall_zones[zone_id][1]) / 2
+            ),
+        )
 
-        claims: List[PickerClaim] = []
-        remaining_cap = picker.capacity
+    def _shelf_pickerwall_zone(self, shelf_id: int) -> Optional[int]:
+        shelf = self.shelfs[shelf_id - 1]
+        if (shelf.x, shelf.y) not in self.goals:
+            return None
+        return self._goal_to_zone.get((shelf.x, shelf.y))
 
-        while self._pickerwall_pending and remaining_cap > 0:
-            shelf_id, sku_entry, order = self._pickerwall_pending[0]
+    def _picker_allowed_zones(self, picker: "Picker") -> List[Optional[int]]:
+        if picker.home_zone is None or self.picker_policy != "zone":
+            return [None]
+
+        allowed = [picker.home_zone]
+        if self.picker_zone_overflow in ("adjacent", "global"):
+            if picker.home_zone - 1 >= 0:
+                allowed.append(picker.home_zone - 1)
+            if picker.home_zone + 1 < len(self.pickerwall_zones):
+                allowed.append(picker.home_zone + 1)
+        if self.picker_zone_overflow == "global":
+            allowed.extend(
+                zone_id
+                for zone_id in range(len(self.pickerwall_zones))
+                if zone_id not in allowed
+            )
+        return allowed
+
+    def _pop_pickerwall_entry_for_zone(
+        self,
+        zone_id: Optional[int],
+    ) -> Optional[Tuple[int, SKUEntry, Order]]:
+        skipped = deque()
+        selected = None
+
+        while self._pickerwall_pending:
+            shelf_id, sku_entry, order = self._pickerwall_pending.popleft()
             shelf = self.shelfs[shelf_id - 1]
 
-            # Skip stale entries (shelf moved away from pickerwall)
             if (shelf.x, shelf.y) not in self.goals or \
                     self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] != shelf_id:
-                self._pickerwall_pending.popleft()
                 logger.debug(
                     "step=%d _claim: skipping stale pickerwall_pending shelf_id=%d",
                     self._cur_steps, shelf_id,
                 )
                 continue
 
-            self._pickerwall_pending.popleft()
-            if sku_entry.quantity <= remaining_cap:
-                claims.append(PickerClaim(
-                    shelf_id=shelf_id,
-                    sku_entry=sku_entry,
-                    order_number=order.order_number,
-                    order=order,
-                ))
-                remaining_cap -= sku_entry.quantity
-            else:
-                # Split: claim what fits, put the remainder back at the front
-                claim_entry = SKUEntry(sku=sku_entry.sku, quantity=remaining_cap)
-                remaining_entry = SKUEntry(sku=sku_entry.sku,
-                                           quantity=sku_entry.quantity - remaining_cap)
-                claims.append(PickerClaim(
-                    shelf_id=shelf_id,
-                    sku_entry=claim_entry,
-                    order_number=order.order_number,
-                    order=order,
-                ))
-                self._pickerwall_pending.appendleft((shelf_id, remaining_entry, order))
-                remaining_cap = 0
+            if zone_id is None or self._shelf_pickerwall_zone(shelf_id) == zone_id:
+                selected = (shelf_id, sku_entry, order)
+                break
+            skipped.append((shelf_id, sku_entry, order))
+
+        while skipped:
+            self._pickerwall_pending.appendleft(skipped.pop())
+        return selected
+
+    def _append_claim_for_entry(
+        self,
+        claims: List["PickerClaim"],
+        entry: Tuple[int, SKUEntry, Order],
+        remaining_cap: int,
+    ) -> int:
+        shelf_id, sku_entry, order = entry
+        if sku_entry.quantity <= remaining_cap:
+            claims.append(PickerClaim(
+                shelf_id=shelf_id,
+                sku_entry=sku_entry,
+                order_number=order.order_number,
+                order=order,
+            ))
+            return remaining_cap - sku_entry.quantity
+
+        claim_entry = SKUEntry(
+            sku=sku_entry.sku,
+            quantity=remaining_cap,
+            unit_cube=sku_entry.unit_cube,
+        )
+        remaining_entry = SKUEntry(
+            sku=sku_entry.sku,
+            quantity=sku_entry.quantity - remaining_cap,
+            unit_cube=sku_entry.unit_cube,
+        )
+        claims.append(PickerClaim(
+            shelf_id=shelf_id,
+            sku_entry=claim_entry,
+            order_number=order.order_number,
+            order=order,
+        ))
+        self._pickerwall_pending.appendleft((shelf_id, remaining_entry, order))
+        return 0
+
+    def _claim_items_for_picker(self, picker: "Picker") -> List["PickerClaim"]:
+        """Claim up to picker.capacity item-units from pickerwall work.
+
+        FIFO mode takes the global queue in arrival order. Zone mode fills from
+        the picker's home zone first, then optional overflow zones.
+        """
+        if not self._pickerwall_pending:
+            return []
+
+        claims: List[PickerClaim] = []
+        remaining_cap = picker.capacity
+        allowed_zones = self._picker_allowed_zones(picker)
+
+        for zone_id in allowed_zones:
+            while self._pickerwall_pending and remaining_cap > 0:
+                entry = self._pop_pickerwall_entry_for_zone(zone_id)
+                if entry is None:
+                    break
+                remaining_cap = self._append_claim_for_entry(
+                    claims,
+                    entry,
+                    remaining_cap,
+                )
 
         for claim in claims:
             if claim.order_number not in self._packaging_slots:
@@ -1208,35 +1381,28 @@ class Warehouse(gym.Env):
                 self._packaging_slots[claim.order_number] = {
                     "required": total_qty,
                     "delivered": 0,
+                    "station": None,
                 }
         return claims
 
     def _build_picker_task(self, picker: "Picker", claims: List["PickerClaim"]) -> "PickerTask":
-        """Group claims by SKU/shelf, ordered by greedy nearest-next proximity."""
-        sku_groups: Dict[int, List[PickerClaim]] = {}
-        for c in claims:
-            sku_groups.setdefault(c.sku_entry.sku, []).append(c)
-
-        resolved = [(grp[0].shelf_id, grp) for grp in sku_groups.values() if grp[0].shelf_id != -1]
-        unresolved = [(grp[0].shelf_id, grp) for grp in sku_groups.values() if grp[0].shelf_id == -1]
+        """Preserve policy claim order while grouping same-shelf work."""
+        shelf_groups: Dict[int, List[PickerClaim]] = {}
+        shelf_order: List[int] = []
+        unresolved: List[PickerClaim] = []
+        for claim in claims:
+            if claim.shelf_id == -1:
+                unresolved.append(claim)
+                continue
+            if claim.shelf_id not in shelf_groups:
+                shelf_groups[claim.shelf_id] = []
+                shelf_order.append(claim.shelf_id)
+            shelf_groups[claim.shelf_id].append(claim)
 
         ordered_claims: List[PickerClaim] = []
-        remaining = list(resolved)
-        cx, cy = picker.x, picker.y
-        while remaining:
-            dists = [
-                abs(self.shelfs[sid - 1].x - cx) + abs(self.shelfs[sid - 1].y - cy)
-                for sid, _ in remaining
-            ]
-            best_idx = int(np.argmin(dists))
-            sid, grp = remaining.pop(best_idx)
-            ordered_claims.extend(grp)
-            s = self.shelfs[sid - 1]
-            cx, cy = s.x, s.y
-
-        for _, grp in unresolved:
-            ordered_claims.extend(grp)
-
+        for shelf_id in shelf_order:
+            ordered_claims.extend(shelf_groups[shelf_id])
+        ordered_claims.extend(unresolved)
         return PickerTask(claims=ordered_claims)
 
     def _maybe_mark_shelf_fulfilled(self, shelf: "Shelf") -> None:
@@ -1259,12 +1425,65 @@ class Warehouse(gym.Env):
             self._cur_steps, shelf.id, shelf.sku,
         )
 
-    def _start_walk_to_packaging(self, picker: "Picker") -> None:
-        """Route the picker to the closest packaging station."""
-        closest_pkg = min(
-            self.packaging_locations,
+    def _packaging_locations_for_picker(self, picker: "Picker") -> List[Tuple[int, int]]:
+        """Return packaging stations local to the picker's home zone when possible."""
+        if self.picker_policy != "zone" or picker.home_zone is None:
+            return self.packaging_locations
+
+        zmin, zmax = self.pickerwall_zones[picker.home_zone]
+        local_packaging = [
+            loc
+            for loc in self.packaging_locations
+            if zmin <= loc[1] <= zmax
+        ]
+        return local_packaging or self.packaging_locations
+
+    def _choose_packaging_station_for_task(
+        self,
+        picker: "Picker",
+        packaging_candidates: List[Tuple[int, int]],
+    ) -> Tuple[int, int]:
+        """Choose a stable packaging station for a picker task.
+
+        Once an order has a packaging station, later picker trips for that
+        order must return to the same station so progress does not appear to
+        jump between cells in the renderer.
+        """
+        assigned_stations = []
+        for claim in picker.task.claims:
+            slot = self._packaging_slots.get(claim.order_number)
+            if slot is not None and slot.get("station") is not None:
+                assigned_stations.append(tuple(slot["station"]))
+
+        if assigned_stations:
+            return min(
+                sorted(set(assigned_stations)),
+                key=lambda loc: abs(loc[0] - picker.x) + abs(loc[1] - picker.y),
+            )
+
+        return min(
+            packaging_candidates,
             key=lambda loc: abs(loc[0] - picker.x) + abs(loc[1] - picker.y),
         )
+
+    def _start_walk_to_packaging(self, picker: "Picker") -> None:
+        """Route the picker to the closest packaging station in its local zone."""
+        packaging_candidates = self._packaging_locations_for_picker(picker)
+        if not packaging_candidates:
+            picker.path = []
+            picker.state = PickerState.AT_PACKAGING
+            logger.info(
+                "step=%d picker_id=%d: all claims picked -> AT_PACKAGING "
+                "without packaging station",
+                self._cur_steps, picker.id,
+            )
+            return
+        closest_pkg = self._choose_packaging_station_for_task(picker, packaging_candidates)
+        picker.packaging_location = closest_pkg
+        for claim in picker.task.claims:
+            slot = self._packaging_slots.get(claim.order_number)
+            if slot is not None and slot.get("station") is None:
+                slot["station"] = closest_pkg
         pkg_target = (closest_pkg[1], closest_pkg[0])  # (row, col) for find_picker_path
         picker.path = self.find_picker_path(
             (picker.y, picker.x), pkg_target, picker, care_for_agents=True
@@ -1273,9 +1492,10 @@ class Warehouse(gym.Env):
         orders = list({c.order_number for c in picker.task.claims})
         logger.info(
             "step=%d picker_id=%d: all claims picked -> WALKING_TO_PACKAGING "
-            "order(s)=%s pkg=(col=%d row=%d) path_len=%d",
+            "order(s)=%s pkg=(col=%d row=%d) home_zone=%s local_candidates=%d path_len=%d",
             self._cur_steps, picker.id, orders,
-            closest_pkg[0], closest_pkg[1], len(picker.path),
+            closest_pkg[0], closest_pkg[1], picker.home_zone,
+            len(packaging_candidates), len(picker.path),
         )
 
     def _picker_walk_to_next_shelf(self, picker: "Picker") -> None:
@@ -1342,6 +1562,30 @@ class Warehouse(gym.Env):
             entry_xy, len(picker.path),
         )
 
+    def _build_pickerwall_zones(self) -> None:
+        """Group pickerwall rows into contiguous zones for simple picker policies."""
+        goal_rows = sorted({y for _, y in self.goals})
+        self.pickerwall_zones: List[Tuple[int, int]] = []
+        self._goal_to_zone: Dict[Tuple[int, int], int] = {}
+        if not goal_rows:
+            return
+
+        start = prev = goal_rows[0]
+        for row in goal_rows[1:]:
+            if row == prev + 1:
+                prev = row
+                continue
+            self.pickerwall_zones.append((start, prev))
+            start = prev = row
+        self.pickerwall_zones.append((start, prev))
+
+        for goal in self.goals:
+            _, gy = goal
+            for zone_id, (zmin, zmax) in enumerate(self.pickerwall_zones):
+                if zmin <= gy <= zmax:
+                    self._goal_to_zone[goal] = zone_id
+                    break
+
     def _picker_next_cell_blocked(
         self,
         picker: "Picker",
@@ -1361,15 +1605,43 @@ class Warehouse(gym.Env):
                 return True
         return False
 
+    def _picker_stalls_this_step(self, picker: "Picker") -> bool:
+        if self.picker_stall_probability <= 0:
+            picker.stalled = False
+            return False
+        picker.stalled = bool(np.random.random() < self.picker_stall_probability)
+        return picker.stalled
+
+    def _pick_ticks_for_current_shelf(self, picker: "Picker") -> int:
+        ticks = self.pick_base_ticks
+        if not self.use_sku_size_pick_time or not picker.task:
+            return max(1, ticks)
+
+        current_shelf_id = picker.task.claims[picker.task.current_claim_index].shelf_id
+        unit_cube = 0.0
+        quantity = 0
+        for claim in picker.task.claims:
+            if claim.picked or claim.shelf_id != current_shelf_id:
+                continue
+            unit_cube = max(unit_cube, float(claim.sku_entry.unit_cube or 0.0))
+            quantity += claim.sku_entry.quantity
+
+        size_ticks = math.ceil(unit_cube * self.pick_unit_cube_tick_scale)
+        quantity_ticks = max(0, quantity - 1)
+        return max(1, ticks + size_ticks + quantity_ticks)
+
     def _advance_pickers(self) -> None:
         """Drive all picker agents through their state machine each step."""
         for picker in self.pickers:
+            if picker.state != PickerState.IDLE and self._picker_stalls_this_step(picker):
+                continue
 
             if picker.fixing_clash > 0:
                 picker.fixing_clash -= 1
 
             # IDLE
             if picker.state == PickerState.IDLE:
+                picker.stalled = False
                 claims = self._claim_items_for_picker(picker)
                 if not claims:
                     continue
@@ -1415,11 +1687,12 @@ class Warehouse(gym.Env):
                     picker.blocked_ticks = 0
                 else:
                     picker.state = PickerState.PICKING
-                    picker.pick_ticks_remaining = _PICK_TICKS
+                    picker.pick_ticks_remaining = self._pick_ticks_for_current_shelf(picker)
                     claim = picker.task.claims[picker.task.current_claim_index]
                     logger.info(
                         "step=%d picker_id=%d: arrived -> PICKING shelf_id=%d sku=%d (pick_ticks=%d)",
-                        self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku, _PICK_TICKS,
+                        self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku,
+                        picker.pick_ticks_remaining,
                     )
 
             # PICKING
@@ -1501,6 +1774,7 @@ class Warehouse(gym.Env):
                     "step=%d picker_id=%d: AT_PACKAGING->IDLE",
                     self._cur_steps, picker.id,
                 )
+                picker.packaging_location = None
                 picker.task = None
                 picker.state = PickerState.IDLE
 

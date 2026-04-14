@@ -364,19 +364,24 @@ class Viewer(object):
         if not hasattr(env, "packaging_locations"):
             return
 
-        partial_slots = []
+        partial_slots_by_station = {}
         if hasattr(env, "_packaging_slots"):
             partial_slots = sorted(
-                ((order_num, s["delivered"], s["required"])
-                 for order_num, s in env._packaging_slots.items()
-                 if s["required"] > 0),
+                (
+                    (order_num, s["delivered"], s["required"], s.get("station"))
+                    for order_num, s in env._packaging_slots.items()
+                    if s["required"] > 0 and s.get("station") is not None
+                ),
                 key=lambda t: t[0],
             )
+            for order_info in partial_slots:
+                station = tuple(order_info[3])
+                partial_slots_by_station.setdefault(station, order_info)
 
         gs = self.grid_size + 1
         pad = _SHELF_PADDING
 
-        for i, (px, py) in enumerate(env.packaging_locations):
+        for px, py in env.packaging_locations:
             y = self.rows - py - 1
 
             x0 = gs * px + pad + 1
@@ -384,8 +389,8 @@ class Viewer(object):
             y0 = gs * y + pad + 1
             y1 = gs * (y + 1) - pad
 
-            # Each square holds at most one partial order (assigned by sorted index)
-            order_info = partial_slots[i] if i < len(partial_slots) else None
+            # Each square displays progress only for an order assigned to this station.
+            order_info = partial_slots_by_station.get((px, py))
 
             base_color = _PACKAGING_PARTIAL_COLOR if order_info else _PACKAGING_COLOR
             base_batch = pyglet.graphics.Batch()
@@ -397,7 +402,7 @@ class Viewer(object):
             base_batch.draw()
 
             if order_info:
-                _order_num, delivered, required = order_info
+                _order_num, delivered, required, _station = order_info
                 fill_ratio = delivered / required if required > 0 else 0.0
 
                 if fill_ratio > 0:

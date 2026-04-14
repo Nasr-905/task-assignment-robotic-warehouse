@@ -29,6 +29,14 @@ def main():
     parser.add_argument("--agvs", type=int, default=14)
     parser.add_argument("--pickers", type=int, default=7)
     parser.add_argument("--render-start", type=int, default=55)
+    parser.add_argument("--picker-policy", choices=["fifo", "zone"], default="fifo")
+    parser.add_argument(
+        "--picker-zone-overflow",
+        choices=["none", "adjacent", "global"],
+        default="adjacent",
+    )
+    parser.add_argument("--picker-stall-probability", type=float, default=0.0)
+    parser.add_argument("--sku-size-pick-time", action="store_true")
     parser.add_argument("--policy", choices=["heuristic", "random"], default="heuristic")
     parser.add_argument("--action-refresh", type=int, default=25)
     args = parser.parse_args()
@@ -37,6 +45,10 @@ def main():
     os.environ["TARWARE_MAX_STEPS"] = str(args.steps)
     os.environ["TARWARE_AGVS"] = str(args.agvs)
     os.environ["TARWARE_PICKERS"] = str(args.pickers)
+    os.environ["TARWARE_PICKER_POLICY"] = args.picker_policy
+    os.environ["TARWARE_PICKER_ZONE_OVERFLOW"] = args.picker_zone_overflow
+    os.environ["TARWARE_PICKER_STALL_PROBABILITY"] = str(args.picker_stall_probability)
+    os.environ["TARWARE_PICKER_USE_SKU_SIZE_TIME"] = "1" if args.sku_size_pick_time else "0"
 
     tile_size = args.tile_size
     if tile_size is None:
@@ -56,6 +68,15 @@ def main():
     print(f"shared cells: {len(env.unwrapped.shared_highway_locs)}")
     print(f"tile size: {tile_size}px")
     print(f"agents: {args.agvs} AGVs, {args.pickers} pickers")
+    print(
+        "picker model: {policy}, overflow={overflow}, stall_p={stall}, "
+        "sku_size_time={sku_time}".format(
+            policy=args.picker_policy,
+            overflow=args.picker_zone_overflow,
+            stall=args.picker_stall_probability,
+            sku_time=args.sku_size_pick_time,
+        )
+    )
     print(f"policy: {args.policy}")
     print(f"render starts at step: {args.render_start}")
     print("close the render window or press Ctrl+C to stop")

@@ -37,12 +37,16 @@ def add_pickwall_region(row, start_col):
         row[col] = 2
         col += PICKWALL_BLOCK_WIDTH
         if i != PICKWALL_REPEATS - 1:
-            row[col] = 3
-            col += PICKWALL_AISLE_WIDTH
-            row[col] = 4
-            col += PACKAGING_WIDTH
-            row[col] = 3
-            col += PICKWALL_AISLE_WIDTH
+            if i == 1:
+                # The middle inter-pickwall channel is an AGV-only highway.
+                col += 2 * PICKWALL_AISLE_WIDTH + PACKAGING_WIDTH
+            else:
+                row[col] = 3
+                col += PICKWALL_AISLE_WIDTH
+                row[col] = 4
+                col += PACKAGING_WIDTH
+                row[col] = 3
+                col += PICKWALL_AISLE_WIDTH
     return col
 
 
