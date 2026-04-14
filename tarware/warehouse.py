@@ -37,6 +37,64 @@ _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
 _AGV_WALKABLE_TILES = {0, 5, 6}
 _PICKER_WALKABLE_TILES = {3, 4, 6}
 _SHARED_HIGHWAY_TILE = 6
+BIN_VOLUME_FT3 = 2.68
+BIN_USABLE_FRACTION = 0.85
+BIN_LEVELS_PER_SIDE = 5
+BINS_PER_LEVEL = 5
+
+
+class BinCellType(Enum):
+    STORAGE = "storage"
+    PICKERWALL = "pickerwall"
+    REPLENISHMENT = "replenishment"
+
+
+BIN_SIDES_BY_CELL_TYPE = {
+    BinCellType.STORAGE: 2,
+    BinCellType.PICKERWALL: 1,
+    BinCellType.REPLENISHMENT: 1,
+}
+
+
+@dataclass(frozen=True)
+class LogicalBin:
+    """Physical bin metadata scaffold.
+
+    Stage A1 records the physical bin structure without changing the existing
+    Shelf movement/order logic yet.
+    """
+    id: int
+    cell_id: int
+    x: int
+    y: int
+    cell_type: BinCellType
+    side: int
+    level: int
+    slot: int
+    volume_ft3: float
+    usable_fraction: float
+
+    @property
+    def usable_volume_ft3(self) -> float:
+        return self.volume_ft3 * self.usable_fraction
+
+
+@dataclass
+class BinCell:
+    """Fixed map cell that contains a conglomerate of logical bins."""
+    id: int
+    x: int
+    y: int
+    cell_type: BinCellType
+    bins: List[LogicalBin]
+
+    @property
+    def bin_count(self) -> int:
+        return len(self.bins)
+
+    @property
+    def usable_volume_ft3(self) -> float:
+        return sum(bin_.usable_volume_ft3 for bin_ in self.bins)
 
 class Entity:
     def __init__(self, id_: int, x: int, y: int):
@@ -191,6 +249,10 @@ class Warehouse(gym.Env):
         normalised_coordinates: bool = False,
     ):
         """Multi-agent robotic warehouse gym environment."""
+        self.bin_volume_ft3 = float(os.getenv("TARWARE_BIN_VOLUME_FT3", str(BIN_VOLUME_FT3)))
+        self.bin_usable_fraction = float(
+            os.getenv("TARWARE_BIN_USABLE_FRACTION", str(BIN_USABLE_FRACTION))
+        )
         self._make_order_sequencer_from_csv(order_csv_path, steps_per_simulated_second)
         self._make_layout_from_csv(map_csv_path)
 
@@ -253,6 +315,74 @@ class Warehouse(gym.Env):
         logger.info(
             "Warehouse: built OrderSequencer from path=%s", order_csv_path
         )
+
+    def _make_bin_cell(
+        self,
+        cell_id: int,
+        x: int,
+        y: int,
+        cell_type: BinCellType,
+        first_bin_id: int,
+    ) -> BinCell:
+        """Build the logical bin conglomerate for one fixed map cell."""
+        bins: List[LogicalBin] = []
+        sides = BIN_SIDES_BY_CELL_TYPE[cell_type]
+        for side in range(sides):
+            for level in range(BIN_LEVELS_PER_SIDE):
+                for slot in range(BINS_PER_LEVEL):
+                    bins.append(
+                        LogicalBin(
+                            id=first_bin_id + len(bins),
+                            cell_id=cell_id,
+                            x=x,
+                            y=y,
+                            cell_type=cell_type,
+                            side=side,
+                            level=level,
+                            slot=slot,
+                            volume_ft3=self.bin_volume_ft3,
+                            usable_fraction=self.bin_usable_fraction,
+                        )
+                    )
+        return BinCell(
+            id=cell_id,
+            x=x,
+            y=y,
+            cell_type=cell_type,
+            bins=bins,
+        )
+
+    def _make_bin_cells(self) -> None:
+        """Create Stage A1 logical bin metadata for storage-like map cells."""
+        self.bin_cells: List[BinCell] = []
+        self.bin_cells_by_xy: Dict[Tuple[int, int], BinCell] = {}
+        next_bin_id = 1
+
+        def add_cell(x: int, y: int, cell_type: BinCellType) -> None:
+            nonlocal next_bin_id
+            cell = self._make_bin_cell(
+                len(self.bin_cells) + 1,
+                x,
+                y,
+                cell_type,
+                next_bin_id,
+            )
+            next_bin_id += len(cell.bins)
+            self.bin_cells.append(cell)
+            self.bin_cells_by_xy[(x, y)] = cell
+
+        for row, col in self.shelf_locs:
+            add_cell(col, row, BinCellType.STORAGE)
+        for x, y in self.goals:
+            add_cell(x, y, BinCellType.PICKERWALL)
+        for x, y in self.replenishment_locs:
+            add_cell(x, y, BinCellType.REPLENISHMENT)
+
+        self.logical_bins: List[LogicalBin] = [
+            bin_
+            for cell in self.bin_cells
+            for bin_ in cell.bins
+        ]
 
     def _make_layout_from_csv(self, map_csv_path: Path) -> None:
         """Build the warehouse layout from a CSV tile map.
@@ -332,6 +462,7 @@ class Warehouse(gym.Env):
             if tile_grid[r, c] == 5
         ]
         self._replenishment_locs_set: set = set(self.replenishment_locs)
+        self._make_bin_cells()
 
         self.agv_spawn_locs = np.argwhere(self.highways == 1)  # (row, col)
 
@@ -399,10 +530,12 @@ class Warehouse(gym.Env):
 
         logger.info(
             "Map loaded from CSV: %s | grid=%s agv_zone=%d picker_zone=%d "
-            "goals=%d shelves=%d replenishment=%d packaging=%d column_height=%d",
+            "goals=%d shelves=%d replenishment=%d packaging=%d bin_cells=%d "
+            "logical_bins=%d bin_usable_volume_ft3=%.3f column_height=%d",
             map_csv_path, self.grid_size, agv_zone_height, picker_zone_rows,
             self.num_goals, len(self.shelf_locs), len(self.replenishment_locs),
-            len(self.packaging_locations), self.column_height,
+            len(self.packaging_locations), len(self.bin_cells), len(self.logical_bins),
+            self.bin_volume_ft3 * self.bin_usable_fraction, self.column_height,
         )
 
     def _is_highway(self, x: int, y: int) -> bool:

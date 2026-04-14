@@ -16,6 +16,37 @@ Blank/missing cells are treated as `0`.
 | `6`   | SHARED_HIGHWAY | Shared AGV/picker aisle; AGVs yield to picker occupancy  |
 | `9`   | BLANK          | Unused blocked cell                                      |
 
+## Physical bin scaffold
+
+Stage A1 adds logical bin metadata for storage-like cells without yet changing
+the existing shelf movement/order logic.
+
+Default bin parameters:
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `TARWARE_BIN_VOLUME_FT3` | `2.68` | Physical volume of one bin |
+| `TARWARE_BIN_USABLE_FRACTION` | `0.85` | Conservative usable fraction of bin volume |
+| `BIN_LEVELS_PER_SIDE` | `5` | Vertical levels per accessible side |
+| `BINS_PER_LEVEL` | `5` | Bins per level |
+
+Derived default capacity:
+
+| Cell tile | Cell type | Sides | Bins/cell | Usable volume/cell |
+|-----------|-----------|-------|-----------|--------------------|
+| `1` | Storage | 2 | 50 | `50 * 2.68 * 0.85 = 113.9 ft^3` |
+| `2` | Pickerwall | 1 | 25 | `25 * 2.68 * 0.85 = 56.95 ft^3` |
+| `5` | Replenishment | 1 | 25 | `25 * 2.68 * 0.85 = 56.95 ft^3` |
+
+In Stage A1, these bins are exposed as environment metadata:
+
+- `env.bin_cells`: fixed map cells that contain logical bins.
+- `env.logical_bins`: flattened list of all logical bins.
+- `env.bin_cells_by_xy[(x, y)]`: lookup for the bin cell at a map coordinate.
+
+SKU assignment and AGV movement still use the existing `Shelf` objects until
+the later bin-level inventory stages are implemented.
+
 ## Zone rules
 
 - **AGV zone**: any row containing at least one AGV-side tile:
