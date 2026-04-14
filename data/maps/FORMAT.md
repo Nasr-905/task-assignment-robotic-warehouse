@@ -20,8 +20,9 @@ Blank/missing cells are treated as `0`.
 
 Stage A1 added logical bin metadata for storage-like cells. Stage A2 assigns
 one SKU per logical storage bin and computes quantity from `Unit cube F` and
-usable bin volume. Existing AGV movement still uses `Shelf` objects as a
-temporary bridge until bin-level movement is implemented.
+usable bin volume. Stage A3 makes the current movable `Shelf` objects explicit
+wrappers around logical bins: picker stock draws down the backing bin, and
+replenishment shelves are backed by replenishment bins.
 
 Default bin parameters:
 
@@ -45,6 +46,8 @@ These bins are exposed as environment metadata:
 - `env.bin_cells`: fixed map cells that contain logical bins.
 - `env.logical_bins`: flattened list of all logical bins.
 - `env.storage_logical_bins`: flattened list of storage-cell bins.
+- `env.replenishment_logical_bins`: flattened list of replenishment-cell bins.
+- `env.logical_bins_by_id[bin_id]`: lookup for a logical bin by id.
 - `env.bin_cells_by_xy[(x, y)]`: lookup for the bin cell at a map coordinate.
 
 Inventory assignment:
@@ -52,10 +55,13 @@ Inventory assignment:
 - Logical storage bins receive one SKU each.
 - Bin quantity is `floor(usable_bin_volume_ft3 / sku_unit_cube_ft3)`.
 - Bins with missing or non-positive SKU cube receive quantity `0`.
-- Current `Shelf` objects inherit SKU/capacity from one representative stocked
-  bin in their storage cell so the existing simulator remains runnable.
-- Pickerwall and replenishment bin metadata exists, but operational handoff and
-  replenishment still use the existing shelf bridge until later stages.
+- Current `Shelf` objects act as movable/rendered wrappers around one backing
+  logical bin, referenced by `shelf.bin_id`.
+- Picker stock decrements the backing logical bin quantity and volume.
+- Exhausted bins and wrappers are removed from SKU lookup indexes.
+- Replenishment-spawned wrappers are backed by an available replenishment bin.
+- Pickerwall bin metadata exists, but pickerwall cell capacity and handoff are
+  still handled by the existing wrapper flow until later stages.
 
 ## Zone rules
 

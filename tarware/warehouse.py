@@ -392,10 +392,20 @@ class Warehouse(gym.Env):
             for cell in self.bin_cells
             for bin_ in cell.bins
         ]
+        self.logical_bins_by_id: Dict[int, LogicalBin] = {
+            bin_.id: bin_
+            for bin_ in self.logical_bins
+        }
         self.storage_logical_bins: List[LogicalBin] = [
             bin_
             for cell in self.bin_cells
             if cell.cell_type == BinCellType.STORAGE
+            for bin_ in cell.bins
+        ]
+        self.replenishment_logical_bins: List[LogicalBin] = [
+            bin_
+            for cell in self.bin_cells
+            if cell.cell_type == BinCellType.REPLENISHMENT
             for bin_ in cell.bins
         ]
 
@@ -1289,6 +1299,67 @@ class Warehouse(gym.Env):
         usable_volume = self.bin_volume_ft3 * self.bin_usable_fraction
         return max(0, int(math.floor(usable_volume / unit_cube)))
 
+    def _logical_bin_for_shelf(self, shelf: "Shelf") -> Optional[LogicalBin]:
+        if shelf.bin_id is None:
+            return None
+        return self.logical_bins_by_id.get(shelf.bin_id)
+
+    def _assign_sku_to_bin(self, bin_: LogicalBin, sku: int) -> int:
+        quantity = self._bin_quantity_for_sku(sku)
+        unit_cube = self.order_sequencer.get_sku_unit_cube(sku) if self.order_sequencer else 0.0
+        bin_.sku = sku
+        bin_.quantity = quantity
+        bin_.used_volume_ft3 = quantity * unit_cube
+        if self.order_sequencer is not None and quantity > 0:
+            bins_for_sku = self.order_sequencer._sku_to_bins.setdefault(sku, [])
+            if bin_ not in bins_for_sku:
+                bins_for_sku.append(bin_)
+        return quantity
+
+    def _remove_bin_from_sku_lookup(self, bin_: LogicalBin) -> None:
+        if self.order_sequencer is None or bin_.sku is None:
+            return
+        bins_for_sku = self.order_sequencer._sku_to_bins.get(bin_.sku)
+        if not bins_for_sku:
+            return
+        self.order_sequencer._sku_to_bins[bin_.sku] = [
+            candidate
+            for candidate in bins_for_sku
+            if candidate.id != bin_.id
+        ]
+
+    def _remove_shelf_from_sku_lookup(self, shelf: "Shelf") -> None:
+        if self.order_sequencer is None or shelf.sku is None:
+            return
+        shelves_for_sku = self.order_sequencer._sku_to_shelves.get(shelf.sku)
+        if not shelves_for_sku:
+            return
+        self.order_sequencer._sku_to_shelves[shelf.sku] = [
+            candidate
+            for candidate in shelves_for_sku
+            if candidate.id != shelf.id
+        ]
+
+    def _decrement_shelf_bin_inventory(self, shelf: "Shelf", quantity: int) -> int:
+        """Pick units from the logical bin backing a movable Shelf wrapper."""
+        bin_ = self._logical_bin_for_shelf(shelf)
+        if bin_ is None:
+            shelf.capacity = max(0, shelf.capacity - quantity)
+            if shelf.capacity <= 0:
+                self._remove_shelf_from_sku_lookup(shelf)
+            return shelf.capacity
+
+        bin_.quantity = max(0, bin_.quantity - quantity)
+        unit_cube = self.order_sequencer.get_sku_unit_cube(bin_.sku) if (
+            self.order_sequencer is not None and bin_.sku is not None
+        ) else 0.0
+        bin_.used_volume_ft3 = bin_.quantity * unit_cube
+        shelf.capacity = bin_.quantity
+        if bin_.quantity <= 0:
+            self._remove_bin_from_sku_lookup(bin_)
+            self._remove_shelf_from_sku_lookup(shelf)
+        return shelf.capacity
+
     def reset(self, seed=None, options=None)-> Tuple:
         Shelf.counter = 0
         Agent.counter = 0
@@ -1428,7 +1499,20 @@ class Warehouse(gym.Env):
         new_shelf = Shelf(rx, ry)
         new_shelf.sku = sku
         new_shelf.from_replenishment = True
-        replenishment_quantity = self._bin_quantity_for_sku(sku)
+        replenishment_bin = next(
+            (
+                bin_
+                for bin_ in self.replenishment_logical_bins
+                if (bin_.x, bin_.y) == (rx, ry)
+                and (bin_.sku is None or bin_.quantity <= 0)
+            ),
+            None,
+        )
+        if replenishment_bin is not None:
+            replenishment_quantity = self._assign_sku_to_bin(replenishment_bin, sku)
+            new_shelf.bin_id = replenishment_bin.id
+        else:
+            replenishment_quantity = self._bin_quantity_for_sku(sku)
         new_shelf.capacity = replenishment_quantity
         new_shelf.initial_capacity = replenishment_quantity
         self.shelfs.append(new_shelf)
@@ -1907,12 +1991,16 @@ class Warehouse(gym.Env):
                     for claim in picker.task.claims:
                         if not claim.picked and claim.shelf_id == current_shelf_id:
                             claim.picked = True
-                            shelf.capacity = max(0, shelf.capacity - claim.sku_entry.quantity)
+                            remaining_stock = self._decrement_shelf_bin_inventory(
+                                shelf,
+                                claim.sku_entry.quantity,
+                            )
                             logger.info(
                                 "step=%d picker_id=%d: picked %d unit(s) from shelf_id=%d "
-                                "sku=%d for order=%s (stock_remaining=%d)",
+                                "bin_id=%s sku=%d for order=%s (stock_remaining=%d)",
                                 self._cur_steps, picker.id, claim.sku_entry.quantity,
-                                shelf.id, shelf.sku, claim.order_number, shelf.capacity,
+                                shelf.id, shelf.bin_id, shelf.sku, claim.order_number,
+                                remaining_stock,
                             )
                     if shelf.capacity <= 0 and not shelf.depleted:
                         shelf.depleted = True
