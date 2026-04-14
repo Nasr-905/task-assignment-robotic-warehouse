@@ -22,7 +22,10 @@ Stage A1 added logical bin metadata for storage-like cells. Stage A2 assigns
 one SKU per logical storage bin and computes quantity from `Unit cube F` and
 usable bin volume. Stage A3 makes the current movable `Shelf` objects explicit
 wrappers around logical bins: picker stock draws down the backing bin, and
-replenishment shelves are backed by replenishment bins.
+replenishment shelves are backed by replenishment bins. Stage A4 tracks
+pickerwall and replenishment slot occupancy: when a wrapper enters one of
+these cells it reserves one of the cell's 25 logical bin slots, and that slot is
+released when the wrapper is picked up.
 
 Default bin parameters:
 
@@ -49,6 +52,9 @@ These bins are exposed as environment metadata:
 - `env.replenishment_logical_bins`: flattened list of replenishment-cell bins.
 - `env.logical_bins_by_id[bin_id]`: lookup for a logical bin by id.
 - `env.bin_cells_by_xy[(x, y)]`: lookup for the bin cell at a map coordinate.
+- `env._pickerwall_slot_by_shelf_id`: wrapper-to-pickerwall-slot occupancy.
+- `env._replenishment_slot_by_shelf_id`: wrapper-to-replenishment-slot occupancy.
+- `env._slot_occupancy_by_slot_id`: logical slot id to backing bin id.
 
 Inventory assignment:
 
@@ -60,8 +66,10 @@ Inventory assignment:
 - Picker stock decrements the backing logical bin quantity and volume.
 - Exhausted bins and wrappers are removed from SKU lookup indexes.
 - Replenishment-spawned wrappers are backed by an available replenishment bin.
-- Pickerwall bin metadata exists, but pickerwall cell capacity and handoff are
-  still handled by the existing wrapper flow until later stages.
+- Pickerwall and replenishment handoff now reserve/release logical slots.
+- The renderer and collision grid still show one movable wrapper per map cell;
+  multiple simultaneous visible wrappers in one pickerwall/replenishment cell
+  are not implemented yet.
 
 ## Zone rules
 

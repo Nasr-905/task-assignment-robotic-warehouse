@@ -311,6 +311,9 @@ class Warehouse(gym.Env):
         self._shelf_to_order: Dict[int, Any] = {}  # shelf_id -> Order that triggered its fetch
         self._packaging_slots: Dict[str, Dict[str, Any]] = {}  # order_number -> {required, delivered, station}
         self._pickerwall_pending: deque = deque()  # (shelf_id, SKUEntry, Order) populated on delivery
+        self._pickerwall_slot_by_shelf_id: Dict[int, int] = {}
+        self._replenishment_slot_by_shelf_id: Dict[int, int] = {}
+        self._slot_occupancy_by_slot_id: Dict[int, int] = {}
 
     @property
     def targets_agvs(self):
@@ -400,6 +403,12 @@ class Warehouse(gym.Env):
             bin_
             for cell in self.bin_cells
             if cell.cell_type == BinCellType.STORAGE
+            for bin_ in cell.bins
+        ]
+        self.pickerwall_logical_bins: List[LogicalBin] = [
+            bin_
+            for cell in self.bin_cells
+            if cell.cell_type == BinCellType.PICKERWALL
             for bin_ in cell.bins
         ]
         self.replenishment_logical_bins: List[LogicalBin] = [
@@ -986,6 +995,7 @@ class Warehouse(gym.Env):
             agent.carrying_shelf = self.shelfs[shelf_id - 1]
             self.grid[CollisionLayers.SHELVES, load_y, load_x] = 0
             self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = shelf_id
+            self._release_reserved_slot_for_shelf(agent.carrying_shelf)
             agent.busy = False
             if self.reward_type == RewardType.GLOBAL:
                 rewards += 0.5
@@ -1001,6 +1011,14 @@ class Warehouse(gym.Env):
         update the request queue and picker-wall pending list.  The agent must
         already be at its final cell (entry or goal) when this is called."""
         shelf = agent.carrying_shelf
+        if not self._reserve_cell_slot_for_shelf(shelf, gx, gy, BinCellType.PICKERWALL):
+            logger.warning(
+                "step=%d delivery blocked: no pickerwall bin slot for shelf_id=%d at (%d,%d)",
+                self._cur_steps, shelf.id, gx, gy,
+            )
+            agent.busy = False
+            return rewards
+
         self.grid[CollisionLayers.SHELVES, gy, gx] = shelf.id
         self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
         shelf.x, shelf.y = gx, gy
@@ -1009,6 +1027,7 @@ class Warehouse(gym.Env):
         agent.has_delivered = False
 
         if shelf not in self.request_queue:
+            self._release_reserved_slot_for_shelf(shelf)
             return rewards
 
         if self.reward_type == RewardType.GLOBAL:
@@ -1340,6 +1359,37 @@ class Warehouse(gym.Env):
             if candidate.id != shelf.id
         ]
 
+    def _reserve_cell_slot_for_shelf(
+        self,
+        shelf: "Shelf",
+        x: int,
+        y: int,
+        cell_type: BinCellType,
+    ) -> bool:
+        """Reserve one logical slot inside a pickerwall/replenishment cell."""
+        cell = self.bin_cells_by_xy.get((x, y))
+        if cell is None or cell.cell_type != cell_type:
+            return False
+        if shelf.bin_id is None:
+            return False
+
+        for slot in cell.bins:
+            if slot.id not in self._slot_occupancy_by_slot_id:
+                self._slot_occupancy_by_slot_id[slot.id] = shelf.bin_id
+                if cell_type == BinCellType.PICKERWALL:
+                    self._pickerwall_slot_by_shelf_id[shelf.id] = slot.id
+                elif cell_type == BinCellType.REPLENISHMENT:
+                    self._replenishment_slot_by_shelf_id[shelf.id] = slot.id
+                return True
+        return False
+
+    def _release_reserved_slot_for_shelf(self, shelf: "Shelf") -> None:
+        slot_id = self._pickerwall_slot_by_shelf_id.pop(shelf.id, None)
+        if slot_id is None:
+            slot_id = self._replenishment_slot_by_shelf_id.pop(shelf.id, None)
+        if slot_id is not None:
+            self._slot_occupancy_by_slot_id.pop(slot_id, None)
+
     def _decrement_shelf_bin_inventory(self, shelf: "Shelf", quantity: int) -> int:
         """Pick units from the logical bin backing a movable Shelf wrapper."""
         bin_ = self._logical_bin_for_shelf(shelf)
@@ -1370,6 +1420,9 @@ class Warehouse(gym.Env):
         self._shelf_to_order = {}
         self._packaging_slots = {}
         self._pickerwall_pending = deque()
+        self._pickerwall_slot_by_shelf_id = {}
+        self._replenishment_slot_by_shelf_id = {}
+        self._slot_occupancy_by_slot_id = {}
 
         self.shelfs = [Shelf(x, y) for (y, x) in self.shelf_locs]
 
@@ -1515,6 +1568,13 @@ class Warehouse(gym.Env):
             replenishment_quantity = self._bin_quantity_for_sku(sku)
         new_shelf.capacity = replenishment_quantity
         new_shelf.initial_capacity = replenishment_quantity
+        if new_shelf.bin_id is not None:
+            self._reserve_cell_slot_for_shelf(
+                new_shelf,
+                rx,
+                ry,
+                BinCellType.REPLENISHMENT,
+            )
         self.shelfs.append(new_shelf)
         self.grid[CollisionLayers.SHELVES, ry, rx] = new_shelf.id
         if self.order_sequencer is not None:
