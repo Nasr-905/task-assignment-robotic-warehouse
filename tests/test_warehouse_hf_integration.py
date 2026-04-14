@@ -107,11 +107,33 @@ class TestWarehouseHumanFactorsIntegration(unittest.TestCase):
             self.assertIn("picker_fatigue_mean", info)
             self.assertIn("picker_fatigue_max", info)
             self.assertIn("picker_energy_total", info)
+            self.assertIn("picker_states", info)
+            self.assertIn("picker_reason_codes", info)
+            self.assertIn("picker_positions", info)
+            self.assertIn("picker_path_lengths", info)
+            self.assertIn("picker_blocked_ticks", info)
+            self.assertIn("picker_blocked_by", info)
+            self.assertIn("picker_stalled", info)
+            self.assertIn("picker_diagnostics", info)
+            self.assertIn("picker_hf_enabled", info)
+            self.assertIn("picker_hf_profile_name", info)
+            self.assertIn("picker_hf_fatigue", info)
+            self.assertIn("picker_hf_fatigue_ratio", info)
+            self.assertIn("picker_hf_energy_expended", info)
+            self.assertIn("picker_hf_movement_delay_probability", info)
+            self.assertIn("picker_hf_failed_pick_probability", info)
+            self.assertIn("picker_hf_movement_delay_events", info)
+            self.assertIn("picker_hf_failed_pick_delay_events_per_picker", info)
+            self.assertIn("picker_hf_cumulative_delay_steps", info)
+            self.assertIn("picker_hf_cumulative_recovery_seconds", info)
 
             self.assertEqual(info["human_factors_model"], "zhao")
             self.assertGreaterEqual(float(info["picker_fatigue_mean"]), 0.0)
             self.assertGreaterEqual(float(info["picker_fatigue_max"]), 0.0)
             self.assertGreaterEqual(float(info["picker_energy_total"]), 0.0)
+            self.assertEqual(len(info["picker_states"]), 1)
+            self.assertEqual(len(info["picker_reason_codes"]), 1)
+            self.assertEqual(len(info["picker_diagnostics"]), 1)
             self.assertFalse(all(terminated) or all(truncated))
         finally:
             env.close()
@@ -148,6 +170,43 @@ class TestWarehouseHumanFactorsIntegration(unittest.TestCase):
             self.assertEqual(env.human_factors_config.model_name, "zhao")
             _, _, _, _, info = env.step([0])
             self.assertEqual(info["human_factors_model"], "zhao")
+        finally:
+            env.close()
+
+    def test_speed_controls_publish_motion_info(self):
+        os.environ["TARWARE_USE_PHYSICAL_SPEEDS"] = "0"
+        os.environ["TARWARE_AGV_CELLS_PER_STEP"] = "0.25"
+        os.environ["TARWARE_PICKER_CELLS_PER_STEP"] = "0.5"
+
+        env = self._make_env(max_steps=3, num_pickers=1)
+        try:
+            env.reset(seed=9)
+            _, _, _, _, info = env.step([0])
+
+            self.assertEqual(info["motion_speed_model"], "cells_per_step")
+            self.assertAlmostEqual(float(info["agv_cells_per_step_configured"]), 0.25)
+            self.assertAlmostEqual(float(info["agv_cells_per_step_effective"]), 0.25)
+            self.assertAlmostEqual(float(info["picker_cells_per_step_configured"]), 0.5)
+            self.assertAlmostEqual(float(info["picker_cells_per_step_effective"]), 0.5)
+            self.assertIn("picker_speed_limited", info)
+            self.assertIn("agv_speed_limited_count", info)
+        finally:
+            env.close()
+
+    def test_movement_credit_supports_substep_speeds(self):
+        os.environ["TARWARE_USE_PHYSICAL_SPEEDS"] = "0"
+        os.environ["TARWARE_AGV_CELLS_PER_STEP"] = "0.25"
+
+        env = self._make_env(max_steps=2, num_pickers=0)
+        try:
+            env.reset(seed=21)
+            agent = env.agents[0]
+            self.assertAlmostEqual(env._agv_cells_per_step_effective, 0.25)
+
+            self.assertFalse(env._consume_motion_credit(agent, env._agv_cells_per_step_effective))
+            self.assertFalse(env._consume_motion_credit(agent, env._agv_cells_per_step_effective))
+            self.assertFalse(env._consume_motion_credit(agent, env._agv_cells_per_step_effective))
+            self.assertTrue(env._consume_motion_credit(agent, env._agv_cells_per_step_effective))
         finally:
             env.close()
 

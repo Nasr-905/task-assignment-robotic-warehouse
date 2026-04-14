@@ -18,6 +18,7 @@ class PhysicalTimeConfig:
     real_seconds_per_simulated_second: float
     grid_cell_size_m: float
     agv_nominal_speed_m_s: float
+    picker_nominal_speed_m_s: float = 1.0
 
     @classmethod
     def from_env(cls, steps_per_simulated_second: float) -> "PhysicalTimeConfig":
@@ -29,6 +30,7 @@ class PhysicalTimeConfig:
             ),
             grid_cell_size_m=max(1e-6, float(os.getenv("TARWARE_GRID_CELL_SIZE_M", "1.0"))),
             agv_nominal_speed_m_s=max(0.0, float(os.getenv("TARWARE_AGV_NOMINAL_SPEED_M_S", "1.0"))),
+            picker_nominal_speed_m_s=max(0.0, float(os.getenv("TARWARE_PICKER_NOMINAL_SPEED_M_S", "1.0"))),
         )
 
     @property
@@ -51,6 +53,12 @@ class PhysicalTimeConfig:
         if self.grid_cell_size_m <= 0:
             return 0.0
         meters_per_step = self.agv_nominal_speed_m_s * self.simulated_seconds_per_step
+        return meters_per_step / self.grid_cell_size_m
+
+    def picker_nominal_cells_per_step(self) -> float:
+        if self.grid_cell_size_m <= 0:
+            return 0.0
+        meters_per_step = self.picker_nominal_speed_m_s * self.simulated_seconds_per_step
         return meters_per_step / self.grid_cell_size_m
 
 

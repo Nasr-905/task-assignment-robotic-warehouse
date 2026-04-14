@@ -1,17 +1,14 @@
 import argparse
-import importlib
 import logging
 import os
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Sequence
 
 import gymnasium as gym
 import numpy as np
 from dotenv import load_dotenv
-import stable_baselines3 as sb3
 
 # Load environment variables from .env file
 if __name__ == "__main__":
@@ -38,9 +35,6 @@ def env_int(name: str, default: int) -> int:
 
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
-    for key in os.environ.keys():
-        if "TARWARE" in key:
-            print(f"{key}={os.environ[key]}")
     if value is None:
         return default
     try:
@@ -81,8 +75,32 @@ def build_env_id(size: str, agvs: int, pickers: int, obs_type: str = "partial") 
     return f"tarware-{size}-{agvs}agvs-{pickers}pickers-{obs_type}obs-v1"
 
 
-def get_env_and_id():
-    return env, ENV_ID
+def _map_csv_path_for_size(size: str) -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "data"
+        / "maps"
+        / f"{size}.csv"
+    )
+
+
+def make_base_env(args) -> gym.Env:
+    map_csv_path = _map_csv_path_for_size(args.size)
+    if not map_csv_path.exists():
+        raise FileNotFoundError(f"Map CSV not found for size={args.size!r}: {map_csv_path}")
+
+    return gym.make(
+        tarware.ENV_ID,
+        map_csv_path=map_csv_path,
+        num_agvs=args.agvs,
+        num_pickers=args.pickers,
+        observation_type=args.obs_type,
+        disable_env_checker=not args.enable_env_checker,
+    )
+
+
+def get_env_and_id(args):
+    return make_base_env(args), build_env_id(args.size, args.agvs, args.pickers, args.obs_type)
 
 
 class JointWarehouseWrapper(gym.Wrapper):
@@ -182,8 +200,9 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
 
 
 def run_classical_eval(args) -> None:
-    env = gym.make(tarware.ENV_ID)
-    LOGGER.info("classical_eval env_id=%s", tarware.ENV_ID)
+    env, env_id = get_env_and_id(args)
+    LOGGER.info("classical_eval env_id=%s", env_id)
+    LOGGER.info("config agvs=%d pickers=%d size=%s obs=%s", args.agvs, args.pickers, args.size, args.obs_type)
     try:
         for episode in range(args.episodes):
             episode_seed = args.seed + episode
@@ -212,10 +231,13 @@ def run_classical_eval(args) -> None:
 
 
 def run_rl_train(args) -> None:
+    import stable_baselines3 as sb3
+
     PPO = sb3.PPO
     base_env, env_id = get_env_and_id(args)
     env = JointWarehouseWrapper(base_env, reward_aggregation=args.reward_aggregation)
     LOGGER.info("rl_train env_id=%s", env_id)
+    LOGGER.info("config agvs=%d pickers=%d size=%s obs=%s", args.agvs, args.pickers, args.size, args.obs_type)
     LOGGER.info("total_timesteps=%s reward_aggregation=%s", args.total_timesteps, args.reward_aggregation)
 
     model = PPO(
@@ -238,10 +260,13 @@ def run_rl_train(args) -> None:
 
 
 def run_rl_eval(args) -> None:
+    import stable_baselines3 as sb3
+
     PPO = sb3.PPO
     base_env, env_id = get_env_and_id(args)
     env = JointWarehouseWrapper(base_env, reward_aggregation=args.reward_aggregation)
     LOGGER.info("rl_eval env_id=%s", env_id)
+    LOGGER.info("config agvs=%d pickers=%d size=%s obs=%s", args.agvs, args.pickers, args.size, args.obs_type)
 
     model_path = Path(args.model_path).expanduser().resolve()
     print(env.observation_space)

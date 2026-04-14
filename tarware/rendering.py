@@ -11,9 +11,13 @@ from gymnasium import error
 from tarware.warehouse import AgentType, Direction
 
 try:
-    from tarware.rendering_overlays import draw_human_factors_overlays
+    from tarware.rendering_overlays import (
+        draw_human_factors_overlays,
+        draw_physical_time_overlay,
+    )
 except Exception:
     draw_human_factors_overlays = None
+    draw_physical_time_overlay = None
 
 if "Apple" in sys.version:
     if "DYLD_FALLBACK_LIBRARY_PATH" in os.environ:
@@ -118,21 +122,127 @@ class Viewer(object):
         )
         self.window.on_close = self.window_closed_by_user
         self.isopen = True
+        self.dashboard_window = None
 
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
 
     def close(self):
+        if self.dashboard_window is not None:
+            self.dashboard_window.close()
+            self.dashboard_window = None
         self.window.close()
 
     def window_closed_by_user(self):
         self.isopen = False
         exit()
 
+    def _dashboard_closed_by_user(self):
+        self.dashboard_window = None
+
+    def _dashboard_enabled(self) -> bool:
+        return os.getenv("TARWARE_RENDER_PICKER_DIAGNOSTICS_WINDOW", "1").lower() in (
+            "1", "true", "yes"
+        )
+
+    def _ensure_dashboard_window(self):
+        if self.dashboard_window is not None:
+            return
+        self.dashboard_window = pyglet.window.Window(
+            width=1220,
+            height=520,
+            caption="Picker Diagnostics",
+            resizable=False,
+        )
+        self.dashboard_window.on_close = self._dashboard_closed_by_user
+
+    def _render_picker_diagnostics_window(self, env):
+        if not self._dashboard_enabled():
+            if self.dashboard_window is not None:
+                self.dashboard_window.close()
+                self.dashboard_window = None
+            return
+
+        diagnostics = getattr(env, "_latest_picker_diagnostics", None)
+        if not diagnostics:
+            return
+
+        self._ensure_dashboard_window()
+        if self.dashboard_window is None:
+            return
+
+        win = self.dashboard_window
+        win.switch_to()
+        win.dispatch_events()
+        gl.glClearColor(0.05, 0.07, 0.09, 1.0)
+        win.clear()
+
+        hf_enabled = getattr(env, "human_factors_config", None)
+        hf_enabled_flag = bool(getattr(hf_enabled, "enabled", False))
+
+        lines = [
+            (
+                f"step={getattr(env, '_cur_steps', 0)} "
+                f"pending_pickerwall={len(getattr(env, '_pickerwall_pending', []))} "
+                f"hf_enabled={int(hf_enabled_flag)}"
+            ),
+            "id state             pos     path blk stall  shelf   blocker      reason",
+            "   profile      fatigue  ratio  energy    p_move  p_fail  d_evt  f_evt  d_steps  rec_s",
+        ]
+        for row in diagnostics:
+            lines.append(
+                f"{row.get('picker_id', -1):>2} "
+                f"{str(row.get('state', ''))[:16]:<16} "
+                f"({row.get('x', -1):>2},{row.get('y', -1):>2}) "
+                f"{row.get('path_len', -1):>4} "
+                f"{row.get('blocked_ticks', -1):>3} "
+                f"{int(bool(row.get('stalled', False))):>5} "
+                f"{row.get('current_shelf_id', -1):>6} "
+                f"{str(row.get('blocked_by', ''))[:12]:<12} "
+                f"{str(row.get('reason_code', ''))[:28]}"
+            )
+            lines.append(
+                f"   {str(row.get('profile_name', ''))[:10]:<10} "
+                f"{float(row.get('fatigue', 0.0)):>8.2f} "
+                f"{float(row.get('fatigue_ratio', 0.0)):>6.3f} "
+                f"{float(row.get('energy_expended', 0.0)):>8.3f} "
+                f"{float(row.get('movement_delay_probability', 0.0)):>7.4f} "
+                f"{float(row.get('failed_pick_probability', 0.0)):>7.4f} "
+                f"{int(row.get('movement_delay_events', 0)):>6} "
+                f"{int(row.get('failed_pick_delay_events', 0)):>6} "
+                f"{int(row.get('cumulative_delay_steps', 0)):>8} "
+                f"{float(row.get('cumulative_recovery_seconds', 0.0)):>6.2f}"
+            )
+
+        y = win.height - 10
+        for idx, text in enumerate(lines):
+            color = (255, 255, 255, 255) if idx == 0 else (220, 220, 220, 255)
+            if idx == 1 or idx == 2:
+                color = (170, 220, 255, 255)
+            label = pyglet.text.Label(
+                text,
+                font_name="Courier New",
+                font_size=10,
+                x=10,
+                y=y,
+                anchor_x="left",
+                anchor_y="top",
+                color=color,
+            )
+            label.draw()
+            y -= 14
+
+        win.flip()
+
     def render(self, env, return_rgb_array=False):
-        gl.glClearColor(*_BACKGROUND_COLOR, 0)
-        self.window.clear()
         self.window.switch_to()
+        gl.glClearColor(
+            _BACKGROUND_COLOR[0] / 255.0,
+            _BACKGROUND_COLOR[1] / 255.0,
+            _BACKGROUND_COLOR[2] / 255.0,
+            1.0,
+        )
+        self.window.clear()
         self.window.dispatch_events()
 
         self._draw_grid()
@@ -147,6 +257,8 @@ class Viewer(object):
         self._draw_pickers(env)
         if draw_human_factors_overlays is not None:
             draw_human_factors_overlays(env, self, gl)
+        if draw_physical_time_overlay is not None:
+            draw_physical_time_overlay(env, self, gl)
 
         if return_rgb_array:
             buffer = pyglet.image.get_buffer_manager().get_color_buffer()
@@ -155,6 +267,7 @@ class Viewer(object):
             arr = arr.reshape(buffer.height, buffer.width, 4)
             arr = arr[::-1, :, 0:3]
         self.window.flip()
+        self._render_picker_diagnostics_window(env)
         return arr if return_rgb_array else self.isopen
 
     def _draw_grid(self):

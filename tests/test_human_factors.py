@@ -69,6 +69,18 @@ class TestPhysicalTimeConfig(unittest.TestCase):
         per_step = tc.per_second_to_per_step(10.0)
         self.assertAlmostEqual(per_step, 2.0, places=5)
 
+    def test_picker_nominal_cells_per_step_scaling(self):
+        """Picker nominal movement should be converted into cells/step."""
+        tc = PhysicalTimeConfig(
+            steps_per_simulated_second=4.0,
+            real_seconds_per_simulated_second=1.0,
+            grid_cell_size_m=0.5,
+            agv_nominal_speed_m_s=1.0,
+            picker_nominal_speed_m_s=0.5,
+        )
+        # 0.5 m/s * 0.25 s/step / 0.5 m/cell = 0.25 cells/step
+        self.assertAlmostEqual(tc.picker_nominal_cells_per_step(), 0.25, places=6)
+
     def test_different_step_rates_preserve_physical_time(self):
         """Test that different step rates yield same physical-time behavior."""
         # Configuration 1: 10 steps/sec

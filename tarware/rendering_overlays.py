@@ -31,6 +31,174 @@ _ENERGY_COLOR = (100, 150, 255)     # Blue for energy indicators
 _OVERLAY_ALPHA = 0.7
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def draw_physical_time_overlay(env, viewer, gl_module) -> None:
+    """Render physical simulation timing on the main render window."""
+    if not PYGLET_AVAILABLE:
+        return
+
+    enabled = os.getenv("TARWARE_RENDER_PHYSICAL_TIME_OVERLAY", "1").lower() in (
+        "1", "true", "yes"
+    )
+    if not enabled:
+        return
+
+    steps = int(getattr(env, "_cur_steps", 0))
+    simulated_seconds_per_step = float(
+        getattr(getattr(env, "time_config", None), "simulated_seconds_per_step", 0.0)
+    )
+    real_seconds_per_step = float(
+        getattr(getattr(env, "time_config", None), "real_seconds_per_step", 0.0)
+    )
+
+    simulated_seconds = float(steps) * simulated_seconds_per_step
+    real_seconds = float(steps) * real_seconds_per_step
+    agv_cells_per_step = float(getattr(env, "_agv_cells_per_step_effective", 1.0))
+    picker_cells_per_step = float(getattr(env, "_picker_cells_per_step_effective", 1.0))
+    speed_model = "physical" if bool(getattr(env, "_use_physical_speed_model", False)) else "cells"
+
+    lines = [
+        "Physical Timing",
+        f"step: {steps}",
+        f"sim time: {_format_duration(simulated_seconds)} ({simulated_seconds:.1f}s)",
+        f"real time: {_format_duration(real_seconds)} ({real_seconds:.1f}s)",
+        (
+            "step scale: "
+            f"sim={simulated_seconds_per_step:.3f}s "
+            f"real={real_seconds_per_step:.3f}s"
+        ),
+        f"speed model: {speed_model}",
+        f"move rate: agv={agv_cells_per_step:.3f} picker={picker_cells_per_step:.3f} cells/step",
+    ]
+
+    panel_margin = 8
+    line_height = 13
+    panel_width = 470
+    panel_height = line_height * len(lines) + 10
+    x1 = viewer.width - panel_margin
+    x0 = max(panel_margin, x1 - panel_width)
+    y1 = viewer.height - panel_margin
+    y0 = max(panel_margin, y1 - panel_height)
+
+    bg = pyglet.graphics.vertex_list(4, ("v2f", [
+        x0, y0,
+        x1, y0,
+        x1, y1,
+        x0, y1,
+    ]))
+    gl_module.glColor4ub(10, 16, 22, 215)
+    bg.draw(gl_module.GL_POLYGON)
+
+    border = pyglet.graphics.vertex_list(4, ("v2f", [
+        x0, y0,
+        x1, y0,
+        x1, y1,
+        x0, y1,
+    ]))
+    gl_module.glColor4ub(175, 200, 220, 255)
+    border.draw(gl_module.GL_LINE_LOOP)
+
+    y = y1 - 5
+    for idx, text in enumerate(lines):
+        color = (235, 235, 235, 255)
+        if idx == 0:
+            color = (255, 255, 255, 255)
+        label = pyglet.text.Label(
+            text,
+            font_name="Courier New",
+            font_size=10,
+            x=x0 + 7,
+            y=y,
+            anchor_x="left",
+            anchor_y="top",
+            color=color,
+        )
+        label.draw()
+        y -= line_height
+
+
+def draw_picker_diagnostics_dashboard(env, viewer, gl_module) -> None:
+    """Render a small real-time dashboard with picker state diagnostics."""
+    if not PYGLET_AVAILABLE:
+        return
+
+    enabled = os.getenv("TARWARE_RENDER_PICKER_DIAGNOSTICS", "1").lower() in ("1", "true", "yes")
+    if not enabled:
+        return
+
+    diagnostics = getattr(env, "_latest_picker_diagnostics", None)
+    if not diagnostics:
+        return
+
+    lines = [
+        "Picker diagnostics",
+        "id state pos path blk stall reason",
+    ]
+    for row in diagnostics:
+        state = str(row.get("state", ""))
+        reason = str(row.get("reason_code", ""))
+        line = (
+            f"{row.get('picker_id', -1):>2} "
+            f"{state[:10]:<10} "
+            f"({row.get('x', -1):>2},{row.get('y', -1):>2}) "
+            f"{row.get('path_len', -1):>3} "
+            f"{row.get('blocked_ticks', -1):>3} "
+            f"{int(bool(row.get('stalled', False))):>5} "
+            f"{reason[:28]}"
+        )
+        lines.append(line)
+
+    panel_margin = 6
+    line_height = 12
+    panel_width = min(viewer.width - panel_margin * 2, 560)
+    panel_height = line_height * len(lines) + 8
+    x0 = panel_margin
+    x1 = x0 + panel_width
+    y1 = viewer.height - panel_margin
+    y0 = max(panel_margin, y1 - panel_height)
+
+    bg = pyglet.graphics.vertex_list(4, ("v2f", [
+        x0, y0,
+        x1, y0,
+        x1, y1,
+        x0, y1,
+    ]))
+    gl_module.glColor4ub(15, 20, 25, 210)
+    bg.draw(gl_module.GL_POLYGON)
+
+    border = pyglet.graphics.vertex_list(4, ("v2f", [
+        x0, y0,
+        x1, y0,
+        x1, y1,
+        x0, y1,
+    ]))
+    gl_module.glColor4ub(180, 180, 180, 255)
+    border.draw(gl_module.GL_LINE_LOOP)
+
+    y = y1 - 4
+    for idx, text in enumerate(lines):
+        color = (230, 230, 230, 255) if idx != 0 else (255, 255, 255, 255)
+        label = pyglet.text.Label(
+            text,
+            font_name="Courier New",
+            font_size=9,
+            x=x0 + 6,
+            y=y,
+            anchor_x="left",
+            anchor_y="top",
+            color=color,
+        )
+        label.draw()
+        y -= line_height
+
+
 def draw_fatigue_ring(
     cx: float,
     cy: float,
@@ -211,6 +379,8 @@ def draw_human_factors_overlays(env, viewer, gl_module) -> None:
             gl_module,
             vertical=False,
         )
+
+    # Picker diagnostics are rendered in a dedicated side window by Viewer.
 
 
 def get_fatigue_color(fatigue_ratio: float) -> tuple:
