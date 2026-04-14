@@ -498,6 +498,63 @@ class TestFatigueProgression(unittest.TestCase):
         # 0.2 per sec = 0.02 per step (since 0.1 sec per step)
         self.assertAlmostEqual(recovery_per_step, 0.02, places=5)
 
+    def test_physical_duration_invariance_across_tick_rates(self):
+        """Zhao-style effort/recovery should depend on physical duration, not tick count."""
+        fast = PhysicalTimeConfig(
+            steps_per_simulated_second=10.0,
+            real_seconds_per_simulated_second=1.0,
+            grid_cell_size_m=1.0,
+            agv_nominal_speed_m_s=1.0,
+            picker_nominal_speed_m_s=1.0,
+        )
+        slow = PhysicalTimeConfig(
+            steps_per_simulated_second=5.0,
+            real_seconds_per_simulated_second=1.0,
+            grid_cell_size_m=1.0,
+            agv_nominal_speed_m_s=1.0,
+            picker_nominal_speed_m_s=1.0,
+        )
+
+        profile = PickerEffortProfile(
+            name="test",
+            metabolic_rate_idle=1.0,
+            metabolic_rate_walking=2.0,
+            metabolic_rate_picking=3.0,
+            fatigue_gain_per_effort=0.5,
+            fatigue_recovery_per_second=0.4,
+            movement_delay_base_prob=0.0,
+            movement_delay_fatigue_prob_gain=0.0,
+            pick_duration_fatigue_gain=0.0,
+            failed_pick_base_prob=0.0,
+            failed_pick_fatigue_prob_gain=0.0,
+            failed_pick_delay_seconds=0.0,
+        )
+
+        state_fast = PickerHumanFactorsState(profile_name="test")
+        state_slow = PickerHumanFactorsState(profile_name="test")
+
+        effort_per_second = 3.0
+        # 1 physical second = 10 steps in fast, 5 steps in slow.
+        for _ in range(10):
+            effort_fast = effort_per_second * fast.simulated_seconds_per_step
+            state_fast.energy_expended += effort_fast
+            state_fast.fatigue += effort_fast * profile.fatigue_gain_per_effort
+        for _ in range(5):
+            effort_slow = effort_per_second * slow.simulated_seconds_per_step
+            state_slow.energy_expended += effort_slow
+            state_slow.fatigue += effort_slow * profile.fatigue_gain_per_effort
+
+        self.assertAlmostEqual(state_fast.energy_expended, state_slow.energy_expended, places=6)
+        self.assertAlmostEqual(state_fast.fatigue, state_slow.fatigue, places=6)
+
+        # Recovery should also match for the same physical duration.
+        for _ in range(10):
+            state_fast.fatigue = max(0.0, state_fast.fatigue - profile.fatigue_recovery_per_second * fast.simulated_seconds_per_step)
+        for _ in range(5):
+            state_slow.fatigue = max(0.0, state_slow.fatigue - profile.fatigue_recovery_per_second * slow.simulated_seconds_per_step)
+
+        self.assertAlmostEqual(state_fast.fatigue, state_slow.fatigue, places=6)
+
 
 class TestReproducibility(unittest.TestCase):
     """Test deterministic behavior for validation."""
