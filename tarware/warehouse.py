@@ -743,6 +743,24 @@ class Warehouse(gym.Env):
                 empty_item_map[id_ - self.num_goals - 1] = 1
         return empty_item_map
 
+    def get_empty_replenishment_information(self) -> np.ndarray[int]:
+        """Returns a boolean array of non-goal action locations free for depleted-bin return."""
+        n_non_goal = len(self.action_id_to_coords_map) - self.num_goals
+        empty_item_map = np.zeros(n_non_goal)
+        for id_, coords in self.action_id_to_coords_map.items():
+            xy = (coords[1], coords[0])
+            if xy not in self._replenishment_locs_set:
+                continue
+            if self.grid[CollisionLayers.SHELVES, coords[0], coords[1]] == 0 and (
+                self.grid[CollisionLayers.CARRIED_SHELVES, coords[0], coords[1]] == 0
+                or self.agents[
+                    self.grid[CollisionLayers.AGVS, coords[0], coords[1]] - 1
+                ].req_action
+                not in [Action.NOOP, Action.TOGGLE_LOAD]
+            ):
+                empty_item_map[id_ - self.num_goals - 1] = 1
+        return empty_item_map
+
     def get_pickerwall_info(self) -> np.ndarray:
         """Returns a boolean array of length num_goals: 1 where a shelf is deposited at that goal slot."""
         occupied = np.zeros(self.num_goals, dtype=np.int32)
@@ -996,6 +1014,8 @@ class Warehouse(gym.Env):
             self.grid[CollisionLayers.SHELVES, load_y, load_x] = 0
             self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = shelf_id
             self._release_reserved_slot_for_shelf(agent.carrying_shelf)
+            if (load_x, load_y) in self._replenishment_locs_set:
+                agent.carrying_shelf.from_replenishment = False
             agent.busy = False
             if self.reward_type == RewardType.GLOBAL:
                 rewards += 0.5
@@ -1122,6 +1142,28 @@ class Warehouse(gym.Env):
                 rewards[agent.id - 1] += 0.1
         return rewards
 
+    def _return_depleted_to_replenishment(
+        self,
+        agent: Agent,
+        rewards: np.ndarray[int],
+    ) -> np.ndarray[int]:
+        """Drop an exhausted wrapper at replenishment and remove it from active circulation."""
+        shelf = agent.carrying_shelf
+        self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
+        self._release_reserved_slot_for_shelf(shelf)
+        self._remove_shelf_from_sku_lookup(shelf)
+        shelf.x, shelf.y = agent.x, agent.y
+        shelf.on_grid = False
+        shelf.from_replenishment = False
+        agent.carrying_shelf = None
+        agent.busy = False
+        agent.has_delivered = False
+        logger.info(
+            "step=%d: depleted shelf_id=%d bin_id=%s returned to replenishment at (%d,%d)",
+            self._cur_steps, shelf.id, shelf.bin_id, agent.x, agent.y,
+        )
+        return rewards
+
     def _execute_unload(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
         # Side drop-off to pickerwall: AGV is at a highway entry cell adjacent to a goal.
         goal_xy = self._agv_entry_to_goal.get((agent.x, agent.y))
@@ -1153,8 +1195,10 @@ class Warehouse(gym.Env):
             agent.busy = False
             return rewards
 
-        # Replenishment zone is take-only - AGVs may never deposit here
         if (agent.x, agent.y) in self._replenishment_locs_set:
+            if agent.carrying_shelf and agent.carrying_shelf.depleted:
+                return self._return_depleted_to_replenishment(agent, rewards)
+            # Replenishment zone only accepts exhausted wrappers returning for refill.
             agent.busy = False
             return rewards
 

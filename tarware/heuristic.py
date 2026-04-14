@@ -79,9 +79,13 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_sleep
                 was_at_goal = (mission.location_x, mission.location_y) in goal_locations
 
                 if was_at_goal:
-                    # displacement pick-up: return shelf to an empty rack slot
-                    empty_shelves = env.get_empty_shelf_information()
-                    empty_location_ids = list(non_goal_location_ids[empty_shelves > 0])
+                    # displacement pick-up: depleted bins return to replenishment;
+                    # non-depleted bins return to an empty rack slot.
+                    if agv.carrying_shelf.depleted:
+                        empty_locations = env.get_empty_replenishment_information()
+                    else:
+                        empty_locations = env.get_empty_shelf_information()
+                    empty_location_ids = list(non_goal_location_ids[empty_locations > 0])
                     busy_loc_ids = [m.location_id for m in assigned_agvs.values()]
                     empty_location_ids = [i for i in empty_location_ids if i not in busy_loc_ids]
                     if empty_location_ids:
