@@ -19,6 +19,12 @@ from tarware.definitions import (Action, AgentType, Direction,
 from tarware.spaces import observation_map
 from tarware.utils import find_sections, get_next_micro_action
 from tarware.order_sequencer import Order, OrderSequencer, SKUEntry
+from tarware.human_factors import (
+    HumanFactorsConfig,
+    PhysicalTimeConfig,
+    PickerEffortProfile,
+    PickerHumanFactorsState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +200,7 @@ class PickerState(Enum):
     WAITING_FOR_SHELF = 3   # next SKU's shelf not yet at pickerwall; picker idles
     WALKING_TO_PACKAGING = 4
     AT_PACKAGING = 5
+    DISTRACTED = 6  # reserved for future human-factors extension
 
 
 @dataclass
@@ -258,11 +265,13 @@ class Warehouse(gym.Env):
         normalised_coordinates: bool = False,
     ):
         """Multi-agent robotic warehouse gym environment."""
+        self.steps_per_simulated_second = max(1e-6, float(steps_per_simulated_second))
+        self.time_config = PhysicalTimeConfig.from_env(self.steps_per_simulated_second)
         self.bin_volume_ft3 = float(os.getenv("TARWARE_BIN_VOLUME_FT3", str(BIN_VOLUME_FT3)))
         self.bin_usable_fraction = float(
             os.getenv("TARWARE_BIN_USABLE_FRACTION", str(BIN_USABLE_FRACTION))
         )
-        self._make_order_sequencer_from_csv(order_csv_path, steps_per_simulated_second)
+        self._make_order_sequencer_from_csv(order_csv_path, self.steps_per_simulated_second)
         self._make_layout_from_csv(map_csv_path)
 
         self.num_agvs = num_agvs
@@ -286,6 +295,12 @@ class Warehouse(gym.Env):
         )
         self.pick_base_ticks = int(os.getenv("TARWARE_PICK_BASE_TICKS", str(_PICK_TICKS)))
         self.pick_unit_cube_tick_scale = float(os.getenv("TARWARE_PICK_UNIT_CUBE_TICK_SCALE", "1.0"))
+        self.human_factors_config = HumanFactorsConfig.from_env(
+            map_name=Path(map_csv_path).stem,
+            time_config=self.time_config,
+            fallback_pick_base_ticks=self.pick_base_ticks,
+            fallback_pick_unit_cube_tick_scale=self.pick_unit_cube_tick_scale,
+        )
 
         self.action_size = len(self.action_id_to_coords_map) + 1
         self.action_space = spaces.Tuple(tuple(self.num_agents * [spaces.Discrete(self.action_size)]))
@@ -314,6 +329,25 @@ class Warehouse(gym.Env):
         self._pickerwall_slot_by_shelf_id: Dict[int, int] = {}
         self._replenishment_slot_by_shelf_id: Dict[int, int] = {}
         self._slot_occupancy_by_slot_id: Dict[int, int] = {}
+        self._picker_hf_profile_by_id: Dict[int, PickerEffortProfile] = {}
+        self._picker_hf_state_by_id: Dict[int, PickerHumanFactorsState] = {}
+        self._picker_hf_episode_delay_steps = 0
+        self._picker_hf_episode_failed_pick_delays = 0
+
+    def steps_to_simulated_seconds(self, steps: int) -> float:
+        return max(0, int(steps)) * self.time_config.simulated_seconds_per_step
+
+    def steps_to_real_seconds(self, steps: int) -> float:
+        return max(0, int(steps)) * self.time_config.real_seconds_per_step
+
+    def simulated_seconds_to_steps(self, seconds: float, ceil: bool = True) -> int:
+        return self.time_config.simulated_seconds_to_steps(seconds, ceil=ceil)
+
+    def rate_per_second_to_per_step(self, value_per_second: float) -> float:
+        return self.time_config.per_second_to_per_step(value_per_second)
+
+    def agv_nominal_cells_per_step(self) -> float:
+        return self.time_config.agv_nominal_cells_per_step()
 
     @property
     def targets_agvs(self):
@@ -1423,6 +1457,10 @@ class Warehouse(gym.Env):
         self._pickerwall_slot_by_shelf_id = {}
         self._replenishment_slot_by_shelf_id = {}
         self._slot_occupancy_by_slot_id = {}
+        self._picker_hf_profile_by_id = {}
+        self._picker_hf_state_by_id = {}
+        self._picker_hf_episode_delay_steps = 0
+        self._picker_hf_episode_failed_pick_delays = 0
 
         self.shelfs = [Shelf(x, y) for (y, x) in self.shelf_locs]
 
@@ -1440,7 +1478,7 @@ class Warehouse(gym.Env):
         self.pickers = []
         if self.num_pickers > 0 and len(self.picker_spawn_locs) > 0:
             picker_spawn_specs = self._balanced_picker_spawn_specs()
-            for py, px, home_zone in picker_spawn_specs:
+            for picker_index, (py, px, home_zone) in enumerate(picker_spawn_specs):
                 picker = Picker(int(px), int(py), Direction.UP)
                 picker.state = PickerState.IDLE
                 picker.task = None
@@ -1450,10 +1488,22 @@ class Warehouse(gym.Env):
                 picker.stalled = False
                 picker.packaging_location = None
                 self.pickers.append(picker)
+                profile = self.human_factors_config.profile_for_picker_index(picker_index)
+                self._picker_hf_profile_by_id[picker.id] = profile
+                self._picker_hf_state_by_id[picker.id] = PickerHumanFactorsState(
+                    profile_name=profile.name,
+                    fatigue=self.human_factors_config.fatigue_min,
+                )
             logger.info(
                 "reset: spawned %d picker(s) evenly across %d zone(s) and %d picker-highway cells",
                 len(self.pickers), len(self.pickerwall_zones), len(self.picker_spawn_locs),
             )
+            if self.human_factors_config.enabled:
+                logger.info(
+                    "reset: human factors enabled default_profile=%s picker_overrides=%s",
+                    self.human_factors_config.default_profile,
+                    self.human_factors_config.picker_profile_overrides,
+                )
 
         self._recalc_grid()
 
@@ -1958,10 +2008,90 @@ class Warehouse(gym.Env):
         picker.stalled = bool(np.random.random() < self.picker_stall_probability)
         return picker.stalled
 
+    def _picker_hf_context(
+        self,
+        picker: "Picker",
+    ) -> Tuple[Optional[PickerHumanFactorsState], Optional[PickerEffortProfile]]:
+        state = self._picker_hf_state_by_id.get(picker.id)
+        profile = self._picker_hf_profile_by_id.get(picker.id)
+        return state, profile
+
+    def _apply_picker_effort(
+        self,
+        state: PickerHumanFactorsState,
+        profile: PickerEffortProfile,
+        metabolic_rate_per_second: float,
+    ) -> None:
+        effort = max(0.0, metabolic_rate_per_second) * self.time_config.simulated_seconds_per_step
+        state.energy_expended += effort
+        fatigue_delta = effort * max(0.0, profile.fatigue_gain_per_effort)
+        state.fatigue = min(self.human_factors_config.fatigue_max, state.fatigue + fatigue_delta)
+
+    def _recover_picker_fatigue(
+        self,
+        state: PickerHumanFactorsState,
+        profile: PickerEffortProfile,
+    ) -> None:
+        recovery = max(0.0, profile.fatigue_recovery_per_second) * self.time_config.simulated_seconds_per_step
+        if recovery <= 0:
+            return
+        state.fatigue = max(self.human_factors_config.fatigue_min, state.fatigue - recovery)
+        state.cumulative_recovery_seconds += self.time_config.simulated_seconds_per_step
+
+    def _picker_fatigue_ratio(self, state: PickerHumanFactorsState) -> float:
+        span = self.human_factors_config.fatigue_max - self.human_factors_config.fatigue_min
+        if span <= 0:
+            return 0.0
+        return min(1.0, max(0.0, (state.fatigue - self.human_factors_config.fatigue_min) / span))
+
+    def _picker_movement_delay_this_step(
+        self,
+        picker: "Picker",
+        state: Optional[PickerHumanFactorsState],
+        profile: Optional[PickerEffortProfile],
+    ) -> bool:
+        if not self.human_factors_config.enabled or state is None or profile is None:
+            return False
+        fatigue_ratio = self._picker_fatigue_ratio(state)
+        delay_prob = (
+            max(0.0, profile.movement_delay_base_prob)
+            + max(0.0, profile.movement_delay_fatigue_prob_gain) * fatigue_ratio
+        )
+        if np.random.random() >= min(1.0, delay_prob):
+            return False
+        state.movement_delay_events += 1
+        state.cumulative_delay_steps += 1
+        self._picker_hf_episode_delay_steps += 1
+        picker.stalled = True
+        return True
+
+    def _picker_failed_pick_delay_this_step(
+        self,
+        picker: "Picker",
+        state: Optional[PickerHumanFactorsState],
+        profile: Optional[PickerEffortProfile],
+    ) -> bool:
+        if not self.human_factors_config.enabled or state is None or profile is None:
+            return False
+        fatigue_ratio = self._picker_fatigue_ratio(state)
+        fail_prob = (
+            max(0.0, profile.failed_pick_base_prob)
+            + max(0.0, profile.failed_pick_fatigue_prob_gain) * fatigue_ratio
+        )
+        if np.random.random() >= min(1.0, fail_prob):
+            return False
+        delay_steps = max(1, self.simulated_seconds_to_steps(profile.failed_pick_delay_seconds))
+        picker.pick_ticks_remaining = delay_steps
+        state.failed_pick_delay_events += 1
+        state.cumulative_delay_steps += delay_steps
+        self._picker_hf_episode_delay_steps += delay_steps
+        self._picker_hf_episode_failed_pick_delays += 1
+        return True
+
     def _pick_ticks_for_current_shelf(self, picker: "Picker") -> int:
-        ticks = self.pick_base_ticks
+        base_seconds = self.human_factors_config.pick_base_seconds
         if not self.use_sku_size_pick_time or not picker.task:
-            return max(1, ticks)
+            return max(1, self.simulated_seconds_to_steps(base_seconds))
 
         current_shelf_id = picker.task.claims[picker.task.current_claim_index].shelf_id
         unit_cube = 0.0
@@ -1972,13 +2102,26 @@ class Warehouse(gym.Env):
             unit_cube = max(unit_cube, float(claim.sku_entry.unit_cube or 0.0))
             quantity += claim.sku_entry.quantity
 
-        size_ticks = math.ceil(unit_cube * self.pick_unit_cube_tick_scale)
-        quantity_ticks = max(0, quantity - 1)
-        return max(1, ticks + size_ticks + quantity_ticks)
+        size_seconds = unit_cube * self.human_factors_config.pick_unit_cube_seconds_scale
+        quantity_seconds = max(0, quantity - 1) * self.human_factors_config.pick_quantity_extra_seconds
+        total_seconds = base_seconds + size_seconds + quantity_seconds
+
+        hf_state, hf_profile = self._picker_hf_context(picker)
+        if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+            fatigue_ratio = self._picker_fatigue_ratio(hf_state)
+            total_seconds *= 1.0 + fatigue_ratio * max(0.0, hf_profile.pick_duration_fatigue_gain)
+
+        return max(1, self.simulated_seconds_to_steps(total_seconds))
 
     def _advance_pickers(self) -> None:
         """Drive all picker agents through their state machine each step."""
         for picker in self.pickers:
+            hf_state, hf_profile = self._picker_hf_context(picker)
+
+            if picker.state in (PickerState.IDLE, PickerState.WAITING_FOR_SHELF):
+                if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+                    self._recover_picker_fatigue(hf_state, hf_profile)
+
             if picker.state != PickerState.IDLE and self._picker_stalls_this_step(picker):
                 continue
 
@@ -2007,6 +2150,8 @@ class Warehouse(gym.Env):
             # WALKING_TO_SHELF
             elif picker.state == PickerState.WALKING_TO_SHELF:
                 if picker.path:
+                    if self._picker_movement_delay_this_step(picker, hf_state, hf_profile):
+                        continue
                     next_xy = picker.path[0]  # (col, row) = (x, y)
                     if self._picker_next_cell_blocked(picker, next_xy):
                         picker.blocked_ticks += 1
@@ -2031,6 +2176,8 @@ class Warehouse(gym.Env):
                     picker.x, picker.y = next_xy[0], next_xy[1]
                     picker.path = picker.path[1:]
                     picker.blocked_ticks = 0
+                    if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+                        self._apply_picker_effort(hf_state, hf_profile, hf_profile.metabolic_rate_walking)
                 else:
                     picker.state = PickerState.PICKING
                     picker.pick_ticks_remaining = self._pick_ticks_for_current_shelf(picker)
@@ -2044,7 +2191,17 @@ class Warehouse(gym.Env):
             # PICKING
             elif picker.state == PickerState.PICKING:
                 picker.pick_ticks_remaining -= 1
+                if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+                    self._apply_picker_effort(hf_state, hf_profile, hf_profile.metabolic_rate_picking)
                 if picker.pick_ticks_remaining <= 0:
+                    if self._picker_failed_pick_delay_this_step(picker, hf_state, hf_profile):
+                        logger.debug(
+                            "step=%d picker_id=%d: failed pick attempt -> delay_steps=%d",
+                            self._cur_steps,
+                            picker.id,
+                            picker.pick_ticks_remaining,
+                        )
+                        continue
                     current_shelf_id = picker.task.claims[picker.task.current_claim_index].shelf_id
                     shelf = self.shelfs[current_shelf_id - 1]
                     # Pick every unpicked claim for this shelf in a single visit
@@ -2075,6 +2232,8 @@ class Warehouse(gym.Env):
             # WALKING_TO_PACKAGING
             elif picker.state == PickerState.WALKING_TO_PACKAGING:
                 if picker.path:
+                    if self._picker_movement_delay_this_step(picker, hf_state, hf_profile):
+                        continue
                     next_xy = picker.path[0]
                     if self._picker_next_cell_blocked(picker, next_xy):
                         picker.blocked_ticks += 1
@@ -2099,6 +2258,8 @@ class Warehouse(gym.Env):
                     picker.x, picker.y = next_xy[0], next_xy[1]
                     picker.path = picker.path[1:]
                     picker.blocked_ticks = 0
+                    if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+                        self._apply_picker_effort(hf_state, hf_profile, hf_profile.metabolic_rate_walking)
                 else:
                     picker.state = PickerState.AT_PACKAGING
                     logger.info(
@@ -2109,6 +2270,8 @@ class Warehouse(gym.Env):
 
             # AT_PACKAGING
             elif picker.state == PickerState.AT_PACKAGING:
+                if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+                    self._apply_picker_effort(hf_state, hf_profile, hf_profile.metabolic_rate_idle)
                 for claim in picker.task.claims:
                     slot = self._packaging_slots.get(claim.order_number)
                     if slot is None:
@@ -2169,12 +2332,14 @@ class Warehouse(gym.Env):
 
         self.observation_space_mapper.extract_environment_info(self)
         new_obs = tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
+        episode_done = bool(all(terminateds) or all(truncateds))
         info = self._build_info(
             agvs_distance_travelled,
             clashes_count,
             picker_yields_count,
             stucks_count,
             shelf_deliveries,
+            episode_done=episode_done,
         )
         return new_obs, list(rewards), terminateds, terminateds, info
 
@@ -2185,6 +2350,7 @@ class Warehouse(gym.Env):
         picker_yields_count: int,
         stucks_count: int,
         shelf_deliveries: int,
+        episode_done: bool = False,
     ) -> Dict[str, np.ndarray]:
         info = {}
         agvs_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents])
@@ -2195,6 +2361,41 @@ class Warehouse(gym.Env):
         info["stucks"] = stucks_count
         info["agvs_distance_travelled"] = agvs_distance_travelled
         info["agvs_idle_time"] = agvs_idle_time
+        info["steps_per_simulated_second"] = self.time_config.steps_per_simulated_second
+        info["simulated_seconds"] = self.steps_to_simulated_seconds(self._cur_steps)
+        info["real_seconds"] = self.steps_to_real_seconds(self._cur_steps)
+        info["agv_nominal_cells_per_step"] = self.agv_nominal_cells_per_step()
+        info["human_factors_model"] = self.human_factors_config.model_name
+
+        if self.pickers:
+            picker_fatigue = []
+            picker_energy_expended = []
+            picker_profiles = []
+            for picker in self.pickers:
+                state = self._picker_hf_state_by_id.get(picker.id)
+                picker_fatigue.append(float(state.fatigue) if state else 0.0)
+                picker_energy_expended.append(float(state.energy_expended) if state else 0.0)
+                picker_profiles.append(state.profile_name if state else "")
+            info["picker_fatigue"] = np.array(picker_fatigue, dtype=np.float32)
+            info["picker_energy_expended"] = np.array(picker_energy_expended, dtype=np.float32)
+            info["picker_profiles"] = picker_profiles
+            info["picker_delay_steps"] = self._picker_hf_episode_delay_steps
+            info["picker_failed_pick_delay_events"] = self._picker_hf_episode_failed_pick_delays
+            info["picker_fatigue_mean"] = float(np.mean(info["picker_fatigue"]))
+            info["picker_fatigue_max"] = float(np.max(info["picker_fatigue"]))
+            info["picker_energy_total"] = float(np.sum(info["picker_energy_expended"]))
+
+            if episode_done:
+                info["episode_human_factors_summary"] = {
+                    "model": self.human_factors_config.model_name,
+                    "picker_count": len(self.pickers),
+                    "delay_steps": int(self._picker_hf_episode_delay_steps),
+                    "failed_pick_delay_events": int(self._picker_hf_episode_failed_pick_delays),
+                    "fatigue_mean": float(np.mean(info["picker_fatigue"])),
+                    "fatigue_max": float(np.max(info["picker_fatigue"])),
+                    "energy_total": float(np.sum(info["picker_energy_expended"])),
+                    "simulated_seconds": float(info["simulated_seconds"]),
+                }
         return info
 
     def compute_valid_action_masks(self, block_conflicting_actions=True):
