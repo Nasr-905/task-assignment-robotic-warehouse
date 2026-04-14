@@ -18,8 +18,10 @@ Blank/missing cells are treated as `0`.
 
 ## Physical bin scaffold
 
-Stage A1 adds logical bin metadata for storage-like cells without yet changing
-the existing shelf movement/order logic.
+Stage A1 added logical bin metadata for storage-like cells. Stage A2 assigns
+one SKU per logical storage bin and computes quantity from `Unit cube F` and
+usable bin volume. Existing AGV movement still uses `Shelf` objects as a
+temporary bridge until bin-level movement is implemented.
 
 Default bin parameters:
 
@@ -38,14 +40,22 @@ Derived default capacity:
 | `2` | Pickerwall | 1 | 25 | `25 * 2.68 * 0.85 = 56.95 ft^3` |
 | `5` | Replenishment | 1 | 25 | `25 * 2.68 * 0.85 = 56.95 ft^3` |
 
-In Stage A1, these bins are exposed as environment metadata:
+These bins are exposed as environment metadata:
 
 - `env.bin_cells`: fixed map cells that contain logical bins.
 - `env.logical_bins`: flattened list of all logical bins.
+- `env.storage_logical_bins`: flattened list of storage-cell bins.
 - `env.bin_cells_by_xy[(x, y)]`: lookup for the bin cell at a map coordinate.
 
-SKU assignment and AGV movement still use the existing `Shelf` objects until
-the later bin-level inventory stages are implemented.
+Inventory assignment:
+
+- Logical storage bins receive one SKU each.
+- Bin quantity is `floor(usable_bin_volume_ft3 / sku_unit_cube_ft3)`.
+- Bins with missing or non-positive SKU cube receive quantity `0`.
+- Current `Shelf` objects inherit SKU/capacity from one representative stocked
+  bin in their storage cell so the existing simulator remains runnable.
+- Pickerwall and replenishment bin metadata exists, but operational handoff and
+  replenishment still use the existing shelf bridge until later stages.
 
 ## Zone rules
 

@@ -56,12 +56,13 @@ BIN_SIDES_BY_CELL_TYPE = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class LogicalBin:
-    """Physical bin metadata scaffold.
+    """Physical bin metadata and Stage A2 inventory assignment.
 
-    Stage A1 records the physical bin structure without changing the existing
-    Shelf movement/order logic yet.
+    Stage A2 assigns one SKU per logical bin and computes quantity from
+    SKU unit cube and usable bin volume. Movement still uses Shelf objects as
+    a bridge until bin-level AGV tasks are implemented.
     """
     id: int
     cell_id: int
@@ -73,10 +74,17 @@ class LogicalBin:
     slot: int
     volume_ft3: float
     usable_fraction: float
+    sku: Optional[int] = None
+    quantity: int = 0
+    used_volume_ft3: float = 0.0
 
     @property
     def usable_volume_ft3(self) -> float:
         return self.volume_ft3 * self.usable_fraction
+
+    @property
+    def remaining_volume_ft3(self) -> float:
+        return max(0.0, self.usable_volume_ft3 - self.used_volume_ft3)
 
 
 @dataclass
@@ -160,6 +168,7 @@ class Shelf(Entity):
         self.depleted: bool = False        # stock hit 0; shelf should be removed when returned
         self.on_grid: bool = True          # False after a depleted shelf is removed from the warehouse
         self.from_replenishment: bool = False  # spawned in the replenishment zone
+        self.bin_id: Optional[int] = None  # Stage A2 bridge to the representative logical bin
 
 class StuckCounter:
     def __init__(self, position: Tuple[int, int]):
@@ -381,6 +390,12 @@ class Warehouse(gym.Env):
         self.logical_bins: List[LogicalBin] = [
             bin_
             for cell in self.bin_cells
+            for bin_ in cell.bins
+        ]
+        self.storage_logical_bins: List[LogicalBin] = [
+            bin_
+            for cell in self.bin_cells
+            if cell.cell_type == BinCellType.STORAGE
             for bin_ in cell.bins
         ]
 
@@ -1221,6 +1236,59 @@ class Warehouse(gym.Env):
 
         return specs
 
+    def _initialize_bin_backed_shelf_inventory(self) -> None:
+        """Bridge Stage A2 bin inventory into legacy Shelf objects.
+
+        Logical bins hold the volume-aware SKU quantities. Until AGV tasks move
+        bins directly, each storage-cell Shelf inherits SKU/capacity from the
+        first stocked bin in that cell so existing order and movement code can
+        continue to run.
+        """
+        if self.order_sequencer is None:
+            return
+
+        self.order_sequencer.initialize_bin_sku_map(self.storage_logical_bins)
+        self.order_sequencer._sku_to_shelves = {}
+
+        for shelf in self.shelfs:
+            cell = self.bin_cells_by_xy.get((shelf.x, shelf.y))
+            stocked_bin = None
+            if cell is not None:
+                stocked_bin = next(
+                    (bin_ for bin_ in cell.bins if bin_.sku is not None and bin_.quantity > 0),
+                    None,
+                )
+
+            if stocked_bin is None:
+                shelf.sku = None
+                shelf.capacity = 0
+                shelf.initial_capacity = 0
+                shelf.bin_id = None
+                continue
+
+            shelf.sku = stocked_bin.sku
+            shelf.capacity = stocked_bin.quantity
+            shelf.initial_capacity = stocked_bin.quantity
+            shelf.bin_id = stocked_bin.id
+            self.order_sequencer._sku_to_shelves.setdefault(stocked_bin.sku, []).append(shelf)
+
+        logger.info(
+            "Stage A2 shelf bridge initialised: shelves=%d storage_bins=%d skus_with_shelf=%d",
+            len(self.shelfs),
+            len(self.storage_logical_bins),
+            len(self.order_sequencer._sku_to_shelves),
+        )
+
+    def _bin_quantity_for_sku(self, sku: int) -> int:
+        """Return how many units of a SKU fit in one usable bin."""
+        if self.order_sequencer is None:
+            return Shelf.DEFAULT_CAPACITY
+        unit_cube = self.order_sequencer.get_sku_unit_cube(sku)
+        if unit_cube <= 0:
+            return 0
+        usable_volume = self.bin_volume_ft3 * self.bin_usable_fraction
+        return max(0, int(math.floor(usable_volume / unit_cube)))
+
     def reset(self, seed=None, options=None)-> Tuple:
         Shelf.counter = 0
         Agent.counter = 0
@@ -1270,7 +1338,7 @@ class Warehouse(gym.Env):
                 "reset: order_sequencer present - using time-gated SKU-based request queue"
             )
             self.order_sequencer.reset()
-            self.order_sequencer.initialize_shelf_sku_map(self.shelfs)
+            self._initialize_bin_backed_shelf_inventory()
             released = self.order_sequencer.release_pending_orders(0)
             logger.info("reset: released %d orders at t=0 (queue capacity=%d)", len(released), self.request_queue_size)
             self.request_queue = []
@@ -1360,8 +1428,9 @@ class Warehouse(gym.Env):
         new_shelf = Shelf(rx, ry)
         new_shelf.sku = sku
         new_shelf.from_replenishment = True
-        new_shelf.capacity = Shelf.DEFAULT_CAPACITY
-        new_shelf.initial_capacity = Shelf.DEFAULT_CAPACITY
+        replenishment_quantity = self._bin_quantity_for_sku(sku)
+        new_shelf.capacity = replenishment_quantity
+        new_shelf.initial_capacity = replenishment_quantity
         self.shelfs.append(new_shelf)
         self.grid[CollisionLayers.SHELVES, ry, rx] = new_shelf.id
         if self.order_sequencer is not None:

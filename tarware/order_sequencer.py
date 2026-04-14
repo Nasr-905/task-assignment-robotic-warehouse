@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import logging
 import random
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
@@ -10,9 +11,18 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 if TYPE_CHECKING:
+    from tarware.warehouse import LogicalBin
     from tarware.warehouse import Shelf
 
 logger = logging.getLogger(__name__)
+
+
+def _find_column(df: pd.DataFrame, stripped_name: str) -> Optional[str]:
+    """Return the actual CSV column whose stripped name matches."""
+    for column in df.columns:
+        if str(column).strip() == stripped_name:
+            return column
+    return None
 
 
 def _hhmmss_to_seconds(hhmmss: int) -> int:
@@ -56,6 +66,7 @@ class OrderSequencer:
         self._steps_per_second = steps_per_simulated_second
 
         df = pd.read_csv(csv_path).dropna(subset=["SKU", "Time Created"])
+        unit_cube_column = _find_column(df, "Unit cube F")
         all_orders_dict: dict[str, Order] = {}
         for _, row in df.iterrows():
             order_number = str(row["Order #"])
@@ -73,7 +84,7 @@ class OrderSequencer:
             order = all_orders_dict[order_number]
             sku = int(row["SKU"])
             quantity = int(row["Shipped Quantity"])
-            unit_cube = float(row.get("Unit cube F", 0.0) or 0.0)
+            unit_cube = float(row.get(unit_cube_column, 0.0) or 0.0) if unit_cube_column else 0.0
             order.skus.append(SKUEntry(sku=sku, quantity=quantity, unit_cube=unit_cube))
 
         all_orders = list(all_orders_dict.values())
@@ -87,6 +98,19 @@ class OrderSequencer:
         # SKUs sorted by descending frequency so the most-requested are assigned first
         sku_counts = df["SKU"].dropna().astype(int).value_counts()
         self._unique_skus: List[int] = list(sku_counts.index)
+        if unit_cube_column:
+            self._sku_unit_cube: Dict[int, float] = (
+                df.dropna(subset=["SKU"])
+                .assign(SKU=lambda d: d["SKU"].astype(int))
+                .groupby("SKU")[unit_cube_column]
+                .median()
+                .fillna(0.0)
+                .astype(float)
+                .to_dict()
+            )
+        else:
+            self._sku_unit_cube = {sku: 0.0 for sku in self._unique_skus}
+        self._sku_to_bins: Dict[int, List["LogicalBin"]] = {}
 
         logger.info(
             "OrderSequencer loaded: orders=%d unique_skus=%d "
@@ -103,6 +127,39 @@ class OrderSequencer:
     def get_unique_skus(self) -> List[int]:
         """Return unique SKUs found in the order file."""
         return list(self._unique_skus)
+
+    def get_sku_unit_cube(self, sku: int) -> float:
+        """Return the median unit cube observed for a SKU in the order file."""
+        return float(self._sku_unit_cube.get(sku, 0.0))
+
+    def _quantity_for_bin(self, bin_: "LogicalBin", sku: int) -> int:
+        unit_cube = self.get_sku_unit_cube(sku)
+        if unit_cube <= 0:
+            return 0
+        return max(0, int(math.floor(bin_.usable_volume_ft3 / unit_cube)))
+
+    def initialize_bin_sku_map(self, bins: Sequence["LogicalBin"]) -> None:
+        """Assign one SKU per logical bin and compute volume-based quantity."""
+        self._sku_to_bins = {}
+        if not self._unique_skus:
+            return
+
+        shuffled = list(bins)
+        random.shuffle(shuffled)
+        for i, bin_ in enumerate(shuffled):
+            sku = self._unique_skus[i % len(self._unique_skus)]
+            quantity = self._quantity_for_bin(bin_, sku)
+            unit_cube = self.get_sku_unit_cube(sku)
+            bin_.sku = sku
+            bin_.quantity = quantity
+            bin_.used_volume_ft3 = quantity * unit_cube
+            if quantity > 0:
+                self._sku_to_bins.setdefault(sku, []).append(bin_)
+
+        logger.info(
+            "SKU->bin map initialised: bins=%d unique_skus_in_orders=%d skus_with_bin=%d",
+            len(bins), len(self._unique_skus), len(self._sku_to_bins),
+        )
 
     def initialize_shelf_sku_map(self, shelfs: Sequence["Shelf"]) -> None:
         """Assign one SKU per shelf and build the SKU->shelf lookup.
