@@ -10,6 +10,11 @@ from gymnasium import error
 
 from tarware.warehouse import AgentType, Direction
 
+try:
+    from tarware.rendering_overlays import draw_human_factors_overlays
+except Exception:
+    draw_human_factors_overlays = None
+
 if "Apple" in sys.version:
     if "DYLD_FALLBACK_LIBRARY_PATH" in os.environ:
         os.environ["DYLD_FALLBACK_LIBRARY_PATH"] += ":/usr/lib"
@@ -140,6 +145,8 @@ class Viewer(object):
         self._draw_shelfs(env)
         self._draw_agents(env)
         self._draw_pickers(env)
+        if draw_human_factors_overlays is not None:
+            draw_human_factors_overlays(env, self, gl)
 
         if return_rgb_array:
             buffer = pyglet.image.get_buffer_manager().get_color_buffer()
