@@ -1,3 +1,4 @@
+import json
 import logging
 from collections import deque
 import math
@@ -40,7 +41,7 @@ _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
 # - 4: packaging
 # - 5: replenishment (AGV take-only)
 # - 6: shared highway
-_AGV_WALKABLE_TILES = {0, 5, 6}
+_AGV_WALKABLE_TILES = {0, 6}
 _PICKER_WALKABLE_TILES = {3, 4, 6}
 _SHARED_HIGHWAY_TILE = 6
 BIN_VOLUME_FT3 = 2.68
@@ -257,6 +258,7 @@ class Warehouse(gym.Env):
     def __init__(
         self,
         map_csv_path: Path,
+        map_json_path: Path,
         order_csv_path: Path,
         num_agvs: int,
         num_pickers: int,
@@ -267,6 +269,8 @@ class Warehouse(gym.Env):
         max_steps: Optional[int],
         reward_type: RewardType,
         normalised_coordinates: bool = False,
+        fit_width: Optional[int] = None,
+        fit_height: Optional[int] = None,
     ):
         """Multi-agent robotic warehouse gym environment."""
         self.steps_per_simulated_second = max(1e-6, float(steps_per_simulated_second))
@@ -276,7 +280,7 @@ class Warehouse(gym.Env):
             os.getenv("TARWARE_BIN_USABLE_FRACTION", str(BIN_USABLE_FRACTION))
         )
         self._make_order_sequencer_from_csv(order_csv_path, self.steps_per_simulated_second)
-        self._make_layout_from_csv(map_csv_path)
+        self._make_layout_from_csv(map_csv_path, map_json_path, fit_width, fit_height)
 
         self.num_agvs = num_agvs
         self.num_pickers = num_pickers
@@ -500,7 +504,7 @@ class Warehouse(gym.Env):
             for bin_ in cell.bins
         ]
 
-    def _make_layout_from_csv(self, map_csv_path: Path) -> None:
+    def _make_layout_from_csv(self, map_csv_path: Path, map_json_path: Path, fit_width: Optional[int] = None, fit_height: Optional[int] = None) -> None:
         """Build the warehouse layout from a CSV tile map.
 
         Tile encoding: 0=highway, 1=shelf/storage, 2=pickerwall, 3=picker_highway,
@@ -510,6 +514,10 @@ class Warehouse(gym.Env):
         df = pd.read_csv(map_csv_path, header=None).fillna(0)
         tile_grid = df.values.astype(int)  # shape (num_rows, num_cols)
         num_rows, num_cols = tile_grid.shape
+
+        with open(map_json_path, "r") as f:
+            map_data = json.load(f)
+        bins_per_shelf = map_data["bins_per_shelf"]
 
         # AGV zone ends at the last row containing any AGV-side tile.
         agv_zone_height = num_rows
@@ -643,6 +651,11 @@ class Warehouse(gym.Env):
                 else:
                     run = 0
         self.column_height = max_run
+
+        # Fill out the fit widths and heights if requested
+        self.render_tile_size: Optional[int] = None
+        if fit_width is not None and fit_height is not None:
+            self.render_tile_size = max(4, min((fit_width - 1) // num_cols - 1, (fit_height - 1) // num_rows - 1))
 
         logger.info(
             "Map loaded from CSV: %s | grid=%s agv_zone=%d picker_zone=%d "
@@ -1412,27 +1425,23 @@ class Warehouse(gym.Env):
         return specs
 
     def _initialize_bin_backed_shelf_inventory(self) -> None:
-        """Bridge Stage A2 bin inventory into legacy Shelf objects.
+        """Pair each shelf 1:1 with a unique SKU and stock one bin per shelf.
 
-        Logical bins hold the volume-aware SKU quantities. Until AGV tasks move
-        bins directly, each storage-cell Shelf inherits SKU/capacity from the
-        first stocked bin in that cell so existing order and movement code can
-        continue to run.
+        Shelves are already placed at a random subset of shelf_locs equal in
+        count to the number of unique SKUs. Here we assign one SKU to each
+        shelf (and to one logical bin in the shelf's cell) so every shelf on
+        the grid has real stock. Storage cells without a shelf are left empty.
         """
         if self.order_sequencer is None:
             return
 
-        self.order_sequencer.initialize_bin_sku_map(self.storage_logical_bins)
+        unique_skus = self.order_sequencer.get_unique_skus()
         self.order_sequencer._sku_to_shelves = {}
+        self.order_sequencer._sku_to_bins = {}
 
-        for shelf in self.shelfs:
+        for shelf, sku in zip(self.shelfs, unique_skus):
             cell = self.bin_cells_by_xy.get((shelf.x, shelf.y))
-            stocked_bin = None
-            if cell is not None:
-                stocked_bin = next(
-                    (bin_ for bin_ in cell.bins if bin_.sku is not None and bin_.quantity > 0),
-                    None,
-                )
+            stocked_bin = cell.bins[0] if (cell is not None and cell.bins) else None
 
             if stocked_bin is None:
                 shelf.sku = None
@@ -1441,17 +1450,19 @@ class Warehouse(gym.Env):
                 shelf.bin_id = None
                 continue
 
-            shelf.sku = stocked_bin.sku
-            shelf.capacity = stocked_bin.quantity
-            shelf.initial_capacity = stocked_bin.quantity
+            quantity = self._assign_sku_to_bin(stocked_bin, sku)
+            shelf.sku = sku
+            shelf.capacity = quantity
+            shelf.initial_capacity = quantity
             shelf.bin_id = stocked_bin.id
-            self.order_sequencer._sku_to_shelves.setdefault(stocked_bin.sku, []).append(shelf)
+            self.order_sequencer._sku_to_shelves.setdefault(sku, []).append(shelf)
 
         logger.info(
-            "Stage A2 shelf bridge initialised: shelves=%d storage_bins=%d skus_with_shelf=%d",
+            "Shelf-SKU pairing initialised: shelves=%d unique_skus=%d skus_with_shelf=%d empty_shelf_locs=%d",
             len(self.shelfs),
-            len(self.storage_logical_bins),
+            len(unique_skus),
             len(self.order_sequencer._sku_to_shelves),
+            len(self.shelf_locs) - len(self.shelfs),
         )
 
     def _bin_quantity_for_sku(self, sku: int) -> int:
@@ -1575,7 +1586,22 @@ class Warehouse(gym.Env):
         self._picker_hf_episode_failed_pick_delays = 0
         self._latest_picker_diagnostics = []
 
-        self.shelfs = [Shelf(x, y) for (y, x) in self.shelf_locs]
+        # Create one shelf per unique SKU, scattered across random shelf_locs.
+        # Remaining shelf_locs are left truly empty (no Shelf object) so each
+        # SKU lives in exactly one bin rather than filling every rack slot.
+        shelf_locs_list = [tuple(loc) for loc in self.shelf_locs]
+        if self.order_sequencer is not None:
+            n_shelves = min(
+                len(self.order_sequencer.get_unique_skus()),
+                len(shelf_locs_list),
+            )
+            loc_indices = np.random.choice(
+                len(shelf_locs_list), size=n_shelves, replace=False
+            )
+            selected_locs = [shelf_locs_list[int(i)] for i in loc_indices]
+        else:
+            selected_locs = shelf_locs_list
+        self.shelfs = [Shelf(x, y) for (y, x) in selected_locs]
 
         agent_loc_ids = np.random.choice(len(self.agv_spawn_locs), size=self.num_agents, replace=False)
         agent_locs = [self.agv_spawn_locs[agent_loc_ids, 0], self.agv_spawn_locs[agent_loc_ids, 1]]
@@ -2729,7 +2755,9 @@ class Warehouse(gym.Env):
     def render(self, mode="human"):
         if not self.renderer:
             from tarware.rendering import Viewer
-            self.renderer = Viewer(self.grid_size)
+            if not self.render_tile_size:
+                self.render_tile_size = int(os.getenv("TARWARE_RENDER_TILE_SIZE", "30"))
+            self.renderer = Viewer(self.render_tile_size, self.grid_size)
         return self.renderer.render(self, return_rgb_array=mode == "rgb_array")
 
     def close(self):

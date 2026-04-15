@@ -200,9 +200,8 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
 
 
 def run_classical_eval(args) -> None:
-    env, env_id = get_env_and_id(args)
-    LOGGER.info("classical_eval env_id=%s", env_id)
-    LOGGER.info("config agvs=%d pickers=%d size=%s obs=%s", args.agvs, args.pickers, args.size, args.obs_type)
+    env = gym.make(tarware.ENV_ID)
+    LOGGER.info("classical_eval env_id=%s", tarware.ENV_ID)
     try:
         for episode in range(args.episodes):
             episode_seed = args.seed + episode

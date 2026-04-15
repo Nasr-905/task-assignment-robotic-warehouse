@@ -10,9 +10,14 @@ from tarware.warehouse import RewardType
 # data/maps directory.
 _MAP_NAME = os.getenv("TARWARE_MAP_NAME", "medium")
 _MAP_CSV_FILENAME = f"{_MAP_NAME}.csv"
+_MAP_JSON_FILENAME = f"{_MAP_NAME}.json"
 _MAP_CSV_PATH = (
     Path(__file__).resolve().parent.parent
     / "data" / "maps" / _MAP_CSV_FILENAME
+)
+_MAP_JSON_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data" / "maps" / _MAP_JSON_FILENAME
 )
 # CSV Path of the order data to be used in the environment. Can be set via the 
 # TARWARE_ORDER_DATA environment variable, or defaults to "order_data_sample" 
@@ -59,6 +64,14 @@ elif _REWARD_TYPE == "two_stage":
     _REWARD_TYPE = RewardType.TWO_STAGE
 else:
     raise ValueError(f"Invalid reward type: {_REWARD_TYPE}. Must be 'individual', 'global', or 'two_stage'.")
+# Fit width for rendering
+_FIT_WIDTH = os.getenv("TARWARE_RENDER_WIDTH", None)
+if _FIT_WIDTH is not None:
+    _FIT_WIDTH = int(_FIT_WIDTH)
+# Fit height for rendering
+_FIT_HEIGHT = os.getenv("TARWARE_RENDER_HEIGHT", None)
+if _FIT_HEIGHT is not None:
+    _FIT_HEIGHT = int(_FIT_HEIGHT)
 
 ENV_ID: str = f"tarware/map-{_MAP_NAME}_order-{_ORDER_DATA}_agvs-{_NUM_AGVS}_pickers-{_NUM_PICKERS}_obs-{_OBS_TYPE}_v1"
 
@@ -67,6 +80,7 @@ gym.register(
     entry_point="tarware.warehouse:Warehouse",
     kwargs={
         "map_csv_path": _MAP_CSV_PATH,
+        "map_json_path": _MAP_JSON_PATH,
         "order_csv_path": _ORDER_CSV_PATH,
         "num_agvs": _NUM_AGVS,
         "num_pickers": _NUM_PICKERS,
@@ -76,5 +90,7 @@ gym.register(
         "max_inactivity_steps": _MAX_INACTIVITY_STEPS,
         "max_steps": _MAX_STEPS,
         "reward_type": _REWARD_TYPE,
+        "fit_width": _FIT_WIDTH,
+        "fit_height": _FIT_HEIGHT,
     },
 )

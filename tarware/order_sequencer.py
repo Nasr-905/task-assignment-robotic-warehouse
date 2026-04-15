@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import collections
 import logging
-import random
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -137,51 +136,6 @@ class OrderSequencer:
         if unit_cube <= 0:
             return 0
         return max(0, int(math.floor(bin_.usable_volume_ft3 / unit_cube)))
-
-    def initialize_bin_sku_map(self, bins: Sequence["LogicalBin"]) -> None:
-        """Assign one SKU per logical bin and compute volume-based quantity."""
-        self._sku_to_bins = {}
-        if not self._unique_skus:
-            return
-
-        shuffled = list(bins)
-        random.shuffle(shuffled)
-        for i, bin_ in enumerate(shuffled):
-            sku = self._unique_skus[i % len(self._unique_skus)]
-            quantity = self._quantity_for_bin(bin_, sku)
-            unit_cube = self.get_sku_unit_cube(sku)
-            bin_.sku = sku
-            bin_.quantity = quantity
-            bin_.used_volume_ft3 = quantity * unit_cube
-            if quantity > 0:
-                self._sku_to_bins.setdefault(sku, []).append(bin_)
-
-        logger.info(
-            "SKU->bin map initialised: bins=%d unique_skus_in_orders=%d skus_with_bin=%d",
-            len(bins), len(self._unique_skus), len(self._sku_to_bins),
-        )
-
-    def initialize_shelf_sku_map(self, shelfs: Sequence["Shelf"]) -> None:
-        """Assign one SKU per shelf and build the SKU->shelf lookup.
-
-        Shelves are shuffled before assignment to scatter SKUs randomly
-        across the warehouse rather than clustering by frequency.
-        """
-        self._sku_to_shelves = {}
-        shuffled = list(shelfs)
-        random.shuffle(shuffled)
-        for i, shelf in enumerate(shuffled):
-            sku = self._unique_skus[i % len(self._unique_skus)]
-            shelf.sku = sku
-            self._sku_to_shelves.setdefault(sku, []).append(shelf)
-
-        covered = len(set(self._unique_skus) & set(self._sku_to_shelves.keys()))
-        logger.info(
-            "SKU->shelf map initialised: shelves=%d unique_skus_in_orders=%d skus_with_shelf=%d",
-            len(shelfs),
-            len(self._unique_skus),
-            covered,
-        )
 
     def release_pending_orders(self, current_step: int) -> List[Order]:
         """Move orders whose release time has been reached into the active queue.
