@@ -11,13 +11,17 @@ from gymnasium import error
 from tarware.warehouse import AgentType, Direction
 
 try:
-    from tarware.rendering_overlays import (
-        draw_human_factors_overlays,
-        draw_physical_time_overlay,
-    )
+    from tarware.rendering_overlays import draw_human_factors_overlays
 except Exception:
     draw_human_factors_overlays = None
-    draw_physical_time_overlay = None
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 if "Apple" in sys.version:
     if "DYLD_FALLBACK_LIBRARY_PATH" in os.environ:
@@ -108,11 +112,11 @@ def get_display(spec):
 
 
 class Viewer(object):
-    def __init__(self, world_size):
+    def __init__(self, grid_size, world_size):
         display = get_display(None)
         self.rows, self.cols = world_size
 
-        self.grid_size = int(os.getenv("TARWARE_RENDER_TILE_SIZE", "30"))
+        self.grid_size = grid_size
         self.icon_size = max(4, int(self.grid_size * 2 / 3))
 
         self.width = 1 + self.cols * (self.grid_size + 1)
@@ -123,6 +127,7 @@ class Viewer(object):
         self.window.on_close = self.window_closed_by_user
         self.isopen = True
         self.dashboard_window = None
+        self.physical_time_window = None
 
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
@@ -131,6 +136,9 @@ class Viewer(object):
         if self.dashboard_window is not None:
             self.dashboard_window.close()
             self.dashboard_window = None
+        if self.physical_time_window is not None:
+            self.physical_time_window.close()
+            self.physical_time_window = None
         self.window.close()
 
     def window_closed_by_user(self):
@@ -155,6 +163,87 @@ class Viewer(object):
             resizable=False,
         )
         self.dashboard_window.on_close = self._dashboard_closed_by_user
+
+    def _physical_time_window_closed_by_user(self):
+        self.physical_time_window = None
+
+    def _physical_time_enabled(self) -> bool:
+        return os.getenv("TARWARE_RENDER_PHYSICAL_TIME_OVERLAY", "1").lower() in (
+            "1", "true", "yes"
+        )
+
+    def _ensure_physical_time_window(self):
+        if self.physical_time_window is not None:
+            return
+        self.physical_time_window = pyglet.window.Window(
+            width=500,
+            height=160,
+            caption="Physical Timing",
+            resizable=False,
+        )
+        self.physical_time_window.on_close = self._physical_time_window_closed_by_user
+
+    def _render_physical_time_window(self, env):
+        if not self._physical_time_enabled():
+            if self.physical_time_window is not None:
+                self.physical_time_window.close()
+                self.physical_time_window = None
+            return
+
+        steps = int(getattr(env, "_cur_steps", 0))
+        simulated_seconds_per_step = float(
+            getattr(getattr(env, "time_config", None), "simulated_seconds_per_step", 0.0)
+        )
+        real_seconds_per_step = float(
+            getattr(getattr(env, "time_config", None), "real_seconds_per_step", 0.0)
+        )
+        simulated_seconds = float(steps) * simulated_seconds_per_step
+        real_seconds = float(steps) * real_seconds_per_step
+        agv_cells_per_step = float(getattr(env, "_agv_cells_per_step_effective", 1.0))
+        picker_cells_per_step = float(getattr(env, "_picker_cells_per_step_effective", 1.0))
+        speed_model = "physical" if bool(getattr(env, "_use_physical_speed_model", False)) else "cells"
+
+        lines = [
+            "Physical Timing",
+            f"step: {steps}",
+            f"sim time: {_format_duration(simulated_seconds)} ({simulated_seconds:.1f}s)",
+            f"real time: {_format_duration(real_seconds)} ({real_seconds:.1f}s)",
+            (
+                "step scale: "
+                f"sim={simulated_seconds_per_step:.3f}s "
+                f"real={real_seconds_per_step:.3f}s"
+            ),
+            f"speed model: {speed_model}",
+            f"move rate: agv={agv_cells_per_step:.3f} picker={picker_cells_per_step:.3f} cells/step",
+        ]
+
+        self._ensure_physical_time_window()
+        if self.physical_time_window is None:
+            return
+
+        win = self.physical_time_window
+        win.switch_to()
+        win.dispatch_events()
+        gl.glClearColor(0.05, 0.07, 0.09, 1.0)
+        win.clear()
+
+        y = win.height - 10
+        for idx, text in enumerate(lines):
+            color = (255, 255, 255, 255) if idx == 0 else (235, 235, 235, 255)
+            label = pyglet.text.Label(
+                text,
+                font_name="Courier New",
+                font_size=10,
+                x=10,
+                y=y,
+                anchor_x="left",
+                anchor_y="top",
+                color=color,
+            )
+            label.draw()
+            y -= 14
+
+        win.flip()
 
     def _render_picker_diagnostics_window(self, env):
         if not self._dashboard_enabled():
@@ -257,8 +346,6 @@ class Viewer(object):
         self._draw_pickers(env)
         if draw_human_factors_overlays is not None:
             draw_human_factors_overlays(env, self, gl)
-        if draw_physical_time_overlay is not None:
-            draw_physical_time_overlay(env, self, gl)
 
         if return_rgb_array:
             buffer = pyglet.image.get_buffer_manager().get_color_buffer()
@@ -268,6 +355,7 @@ class Viewer(object):
             arr = arr[::-1, :, 0:3]
         self.window.flip()
         self._render_picker_diagnostics_window(env)
+        self._render_physical_time_window(env)
         return arr if return_rgb_array else self.isopen
 
     def _draw_grid(self):
