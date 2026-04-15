@@ -16,6 +16,7 @@ HHMMSS encoding where window k (1-indexed) → k * 100
 """
 
 import csv
+import math
 import os
 import random
 from collections.abc import Sequence
@@ -26,8 +27,8 @@ import numpy as np
 # ============================================================
 
 # Catalog & volume
-NUM_SKUS        = 80    # unique SKUs in the catalogue
-NUM_TIME_BUCKETS = 120   # number of 60-second windows to simulate
+NUM_SKUS        = 360    # unique SKUs in the catalogue
+NUM_TIME_BUCKETS = 180   # number of 60-second windows to simulate
 
 # Poisson rate: expected orders arriving per 60-second window.
 # Total orders ≈ POISSON_LAMBDA * NUM_TIME_BUCKETS.
@@ -40,6 +41,14 @@ POISSON_LAMBDA  = 15.0
 #   0.0  → uniform   (all SKUs equally likely)
 #   2.0  → quadratic drop-off
 SKU_DIST_EXPONENT = 1.0
+
+# .20)Compute lognormal parameters for unit cube (mean=0.20, std=0
+desired_mean = 0.20
+desired_std = 0.20
+coefficient_of_variation_sq = (desired_std / desired_mean) ** 2
+sigma_cube = math.sqrt(math.log(coefficient_of_variation_sq + 1))
+mu_cube = math.log(desired_mean) - sigma_cube ** 2 / 2
+
 
 # Relative probabilities for the number of SKU *lines* per order.
 # Index 0 → 1 line, index 1 → 2 lines, index 2 → 3 lines, …
@@ -101,12 +110,13 @@ def hhmmss_hour(hhmmss_int: int) -> int:
     return hhmmss_int // 10000
 
 
-def build_sku_catalog(n: int, exponent: float, rng: random.Random) -> list[dict]:
+def build_sku_catalog(n: int, exponent: float, rng: random.Random, np_rng, mu_cube: float, sigma_cube: float) -> list[dict]:
     """
-    Create n SKUs with IDs and pre-computed sampling weights.
+    Create n SKUs with IDs, pre-computed sampling weights, and unit cube values.
 
     SKU IDs are random 6-digit integers (matching the sample data style).
     Rank-1 (most popular) gets weight 1, rank-r gets weight 1/r^exponent.
+    Unit cube values are sampled from a lognormal distribution.
     """
     # Use a sorted set so IDs are unique
     ids: set[int] = set()
@@ -117,7 +127,15 @@ def build_sku_catalog(n: int, exponent: float, rng: random.Random) -> list[dict]
     catalog = []
     for rank, sku_id in enumerate(sorted_ids, start=1):
         weight = 1.0 / (rank ** exponent)
-        catalog.append({"sku_id": float(sku_id), "rank": rank, "weight": weight})
+        unit_cube = round(np_rng.lognormal(mu_cube, sigma_cube), 9)
+        large_line = "large" if unit_cube > 1.0 else "OK"
+        catalog.append({
+            "sku_id": float(sku_id),
+            "rank": rank,
+            "weight": weight,
+            "unit_cube": unit_cube,
+            "large_line": large_line
+        })
 
     # Normalise weights
     total = sum(c["weight"] for c in catalog)
@@ -170,7 +188,7 @@ def generate(
     rng    = random.Random(seed)
     np_rng = np.random.default_rng(seed)
 
-    catalog = build_sku_catalog(num_skus, sku_dist_exponent, rng)
+    catalog = build_sku_catalog(num_skus, sku_dist_exponent, rng, np_rng, mu_cube, sigma_cube)
 
     rows         = []
     order_counter = order_id_base
@@ -211,9 +229,10 @@ def generate(
             shipped_qty = sample_sku_count(shipped_qty_weights, rng)
 
             for sku_id in chosen:
-                # Synthetic unit cube value (loosely matching the sample range)
-                unit_cube = round(rng.uniform(0.01, 2.0), 9)
-                large_line = "large" if unit_cube > 1.0 else "OK"
+                # Look up unit cube and large_line from catalog
+                sku_info = next(c for c in catalog if c["sku_id"] == sku_id)
+                unit_cube = sku_info["unit_cube"]
+                large_line = sku_info["large_line"]
 
                 rows.append({
                     "Order #":          order_id,

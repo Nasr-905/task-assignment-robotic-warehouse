@@ -24,7 +24,7 @@ class Mission:
     at_location: bool = False
 
 
-def heuristic_episode(env, render=False, seed=None, render_start=0, render_sleep=0.0):
+def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=0, render_sleep=0.0):
     # non_goal_location_ids aligns with the index ordering of get_empty_shelf_information
     non_goal_location_ids = []
     for id_, coords in env.action_id_to_coords_map.items():
@@ -203,7 +203,7 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_sleep
         done = all(done)
         all_infos.append(info)
 
-        if render and timestep >= render_start:
+        if render and timestep >= render_start and timestep % (render_skip + 1) == 0:
             env.render(mode="human")
             if render_sleep:
                 time.sleep(render_sleep)

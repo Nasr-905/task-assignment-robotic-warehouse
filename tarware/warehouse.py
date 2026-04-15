@@ -57,7 +57,7 @@ class BinCellType(Enum):
 
 
 BIN_SIDES_BY_CELL_TYPE = {
-    BinCellType.STORAGE: 2,
+    BinCellType.STORAGE: 1,
     BinCellType.PICKERWALL: 1,
     BinCellType.REPLENISHMENT: 1,
 }
