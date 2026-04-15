@@ -26,12 +26,12 @@ import numpy as np
 # ============================================================
 
 # Catalog & volume
-NUM_SKUS        = 10    # unique SKUs in the catalogue
-NUM_TIME_BUCKETS = 60   # number of 60-second windows to simulate
+NUM_SKUS        = 80    # unique SKUs in the catalogue
+NUM_TIME_BUCKETS = 120   # number of 60-second windows to simulate
 
 # Poisson rate: expected orders arriving per 60-second window.
 # Total orders ≈ POISSON_LAMBDA * NUM_TIME_BUCKETS.
-POISSON_LAMBDA  = 5.0
+POISSON_LAMBDA  = 15.0
 
 # SKU frequency distribution
 # Each SKU is ranked 1..NUM_SKUS by popularity.
@@ -49,7 +49,7 @@ SKU_COUNT_WEIGHTS = [50, 20, 10, 5, 5, 5, 3, 3, 2, 2, 1, 1, 1]   # up to 13 line
 # Relative probabilities for the shipped quantity of each SKU line.
 # Index 0 → qty 1, index 1 → qty 2, index 2 → qty 3, …
 # Values do NOT need to sum to 1 — they are normalised automatically.
-SHIPPED_QTY_WEIGHTS = [70, 20, 10, 500]   # up to qty 4
+SHIPPED_QTY_WEIGHTS = [70, 20, 10, 5]   # up to qty 4
 
 # Date written into every row  (YYYYMMDD)
 ORDER_DATE = "20260101"

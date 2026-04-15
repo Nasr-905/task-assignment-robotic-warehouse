@@ -1,0 +1,11 @@
+{
+    "bay_width_shelves": 4,
+    "storage_bay_depth_shelves": 2,
+    "pickerwall_bay_depth_shelves": 1,
+    "replenishment_bay_depth_shelves": 1,
+    "bay_height_bins": 5,
+    "bay_width_bins": 5,
+    "storage_bay_depth_bins": 2,
+    "pickerwall_bay_depth_bins": 2,
+    "replenishment_bay_depth_bins": 2
+}
