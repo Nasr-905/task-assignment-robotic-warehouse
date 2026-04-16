@@ -275,7 +275,7 @@ class Viewer(object):
                 f"pending_pickerwall={len(getattr(env, '_pickerwall_pending', []))} "
                 f"hf_enabled={int(hf_enabled_flag)}"
             ),
-            "id state             pos     path blk stall  shelf   blocker      reason",
+            "id state             pos     path blk stall    bin   blocker      reason",
             "   profile      fatigue  ratio  energy    p_move  p_fail  d_evt  f_evt  d_steps  rec_s",
         ]
         for row in diagnostics:
@@ -286,7 +286,7 @@ class Viewer(object):
                 f"{row.get('path_len', -1):>4} "
                 f"{row.get('blocked_ticks', -1):>3} "
                 f"{int(bool(row.get('stalled', False))):>5} "
-                f"{row.get('current_shelf_id', -1):>6} "
+                f"{row.get('current_bin_id', -1):>6} "
                 f"{str(row.get('blocked_by', ''))[:12]:<12} "
                 f"{str(row.get('reason_code', ''))[:28]}"
             )
@@ -417,19 +417,41 @@ class Viewer(object):
         batch.draw()
 
     def _draw_shelfs(self, env):
+        """Render each static shelf colored by its bin contents.
+
+        Pickerwall shelves are handled by _draw_goals; this draws storage and
+        replenishment fixtures only. A shelf's body color reflects the
+        aggregate state of its bins (requested / depleted / fresh / mixed).
+        A label shows ``bins_occupied/num_slots``.
+        """
+        from tarware.warehouse import BinCellType
+
+        request_queue_ids = {b.id for b in env.request_queue if b is not None}
         batch = pyglet.graphics.Batch()
 
-        for shelf in env.shelfs:
-            if not shelf.on_grid:
-                continue
+        drawable = [s for s in env.shelfs if s.cell_type != BinCellType.PICKERWALL]
+
+        for shelf in drawable:
             x, y = shelf.x, shelf.y
-            y = self.rows - y - 1  # pyglet rendering is reversed
-            if shelf.depleted:
+            y_disp = self.rows - y - 1
+
+            bins = [b for b in shelf.bin_slots if b is not None]
+            if not bins:
+                # empty slot marker only (shelf location already drawn in gray)
+                continue
+
+            any_requested = any(b.id in request_queue_ids for b in bins)
+            any_depleted = any(b.depleted for b in bins)
+            any_fresh = any(b.from_replenishment for b in bins)
+
+            if any_requested:
+                shelf_color = _SHELF_REQ_COLOR
+            elif any_depleted:
                 shelf_color = _DEPLETED_SHELF_COLOR
-            elif shelf.from_replenishment:
+            elif shelf.cell_type == BinCellType.REPLENISHMENT or any_fresh:
                 shelf_color = _REPLENISHMENT_SHELF_COLOR
             else:
-                shelf_color = _SHELF_REQ_COLOR if shelf in env.request_queue else _SHELF_COLOR
+                shelf_color = _SHELF_COLOR
 
             batch.add(
                 4,
@@ -438,30 +460,31 @@ class Viewer(object):
                 (
                     "v2f",
                     (
-                        (self.grid_size + 1) * x + _SHELF_PADDING + 1,  # TL - X
-                        (self.grid_size + 1) * y + _SHELF_PADDING + 1,  # TL - Y
-                        (self.grid_size + 1) * (x + 1) - _SHELF_PADDING,  # TR - X
-                        (self.grid_size + 1) * y + _SHELF_PADDING + 1,  # TR - Y
-                        (self.grid_size + 1) * (x + 1) - _SHELF_PADDING,  # BR - X
-                        (self.grid_size + 1) * (y + 1) - _SHELF_PADDING,  # BR - Y
-                        (self.grid_size + 1) * x + _SHELF_PADDING + 1,  # BL - X
-                        (self.grid_size + 1) * (y + 1) - _SHELF_PADDING,  # BL - Y
+                        (self.grid_size + 1) * x + _SHELF_PADDING + 1,
+                        (self.grid_size + 1) * y_disp + _SHELF_PADDING + 1,
+                        (self.grid_size + 1) * (x + 1) - _SHELF_PADDING,
+                        (self.grid_size + 1) * y_disp + _SHELF_PADDING + 1,
+                        (self.grid_size + 1) * (x + 1) - _SHELF_PADDING,
+                        (self.grid_size + 1) * (y_disp + 1) - _SHELF_PADDING,
+                        (self.grid_size + 1) * x + _SHELF_PADDING + 1,
+                        (self.grid_size + 1) * (y_disp + 1) - _SHELF_PADDING,
                     ),
                 ),
                 ("c3B", 4 * shelf_color),
             )
         batch.draw()
 
-        # Draw capacity labels on each shelf
-        for shelf in env.shelfs:
-            if not shelf.on_grid:
+        # Label each occupied shelf with "bin_count/num_slots".
+        for shelf in drawable:
+            occupied = shelf.bin_count
+            if occupied == 0:
                 continue
             sx, sy = shelf.x, shelf.y
-            sy = self.rows - sy - 1
+            sy_disp = self.rows - sy - 1
             cx = (self.grid_size + 1) * sx + self.grid_size // 2 + 1
-            cy = (self.grid_size + 1) * sy + self.grid_size // 2 + 1
+            cy = (self.grid_size + 1) * sy_disp + self.grid_size // 2 + 1
             label = pyglet.text.Label(
-                str(shelf.capacity),
+                f"{occupied}/{shelf.num_slots}",
                 font_name="Arial",
                 font_size=7,
                 x=cx, y=cy,
@@ -471,22 +494,24 @@ class Viewer(object):
             label.draw()
 
     def _draw_goals(self, env):
+        """Render pickerwall slots. Each goal cell is a pickerwall Shelf with
+        ``bins_per_shelf`` slots; color reflects whether any bin is fulfilled.
+        A ``bin_count/num_slots`` label shows current occupancy.
+        """
         batch = pyglet.graphics.Batch()
 
         fulfilled_positions = set()
-        if hasattr(env, "shelfs") and hasattr(env, "grid"):
-            from tarware.definitions import CollisionLayers
-            for gx, gy in env.goals:
-                shelf_id = env.grid[CollisionLayers.SHELVES, gy, gx]
-                if shelf_id != 0:
-                    shelf = env.shelfs[shelf_id - 1]
-                    if shelf.fulfilled:
-                        fulfilled_positions.add((gx, gy))
+        pickerwall_shelves_by_xy = {}
+        if hasattr(env, "pickerwall_shelves"):
+            for shelf in env.pickerwall_shelves:
+                pickerwall_shelves_by_xy[(shelf.x, shelf.y)] = shelf
+                if any(b is not None and b.fulfilled for b in shelf.bin_slots):
+                    fulfilled_positions.add((shelf.x, shelf.y))
 
         for goal in env.goals:
             x, y = goal
             color = _SHELF_FULFILLED_COLOR if (x, y) in fulfilled_positions else _GOAL_COLOR
-            y = self.rows - y - 1  # pyglet rendering is reversed
+            y_disp = self.rows - y - 1
             batch.add(
                 4,
                 gl.GL_QUADS,
@@ -494,19 +519,34 @@ class Viewer(object):
                 (
                     "v2f",
                     (
-                        (self.grid_size + 1) * x + 1,  # TL - X
-                        (self.grid_size + 1) * y + 1,  # TL - Y
-                        (self.grid_size + 1) * (x + 1),  # TR - X
-                        (self.grid_size + 1) * y + 1,  # TR - Y
-                        (self.grid_size + 1) * (x + 1),  # BR - X
-                        (self.grid_size + 1) * (y + 1),  # BR - Y
-                        (self.grid_size + 1) * x + 1,  # BL - X
-                        (self.grid_size + 1) * (y + 1),  # BL - Y
+                        (self.grid_size + 1) * x + 1,
+                        (self.grid_size + 1) * y_disp + 1,
+                        (self.grid_size + 1) * (x + 1),
+                        (self.grid_size + 1) * y_disp + 1,
+                        (self.grid_size + 1) * (x + 1),
+                        (self.grid_size + 1) * (y_disp + 1),
+                        (self.grid_size + 1) * x + 1,
+                        (self.grid_size + 1) * (y_disp + 1),
                     ),
                 ),
                 ("c3B", 4 * color),
             )
         batch.draw()
+
+        for (gx, gy), shelf in pickerwall_shelves_by_xy.items():
+            if shelf.bin_count == 0:
+                continue
+            y_disp = self.rows - gy - 1
+            cx = (self.grid_size + 1) * gx + self.grid_size // 2 + 1
+            cy = (self.grid_size + 1) * y_disp + self.grid_size // 2 + 1
+            pyglet.text.Label(
+                f"{shelf.bin_count}/{shelf.num_slots}",
+                font_name="Arial",
+                font_size=7,
+                x=cx, y=cy,
+                anchor_x="center", anchor_y="center",
+                color=(255, 255, 255, 255),
+            ).draw()
 
     def _draw_picker_zone(self, env):
         if not hasattr(env, "picker_highways") or not env.picker_highways.any():
@@ -697,7 +737,7 @@ class Viewer(object):
                 verts += [x, y]
             circle = pyglet.graphics.vertex_list(resolution, ("v2f", verts))
 
-            draw_color = _AGENT_LOADED_COLOR if agent.carrying_shelf else _AGENT_COLOR
+            draw_color = _AGENT_LOADED_COLOR if agent.carrying_bin else _AGENT_COLOR
 
             gl.glColor3ub(*draw_color)
             circle.draw(gl.GL_POLYGON)
@@ -743,6 +783,24 @@ class Viewer(object):
                 ("c3B", (*_AGENT_DIR_COLOR, *_AGENT_DIR_COLOR)),
             )
         batch.draw()
+
+        # Overlay the carried bin's unit count on each loaded AGV.
+        for agent in env.agents:
+            if not agent.carrying_bin:
+                continue
+            col, row = agent.x, agent.y
+            row = self.rows - row - 1
+            cx = (self.grid_size + 1) * col + self.grid_size // 2 + 1
+            cy = (self.grid_size + 1) * row + self.grid_size // 2 + 1
+            pyglet.text.Label(
+                str(int(agent.carrying_bin.quantity)),
+                font_name="Arial",
+                font_size=7,
+                bold=True,
+                x=cx, y=cy,
+                anchor_x="center", anchor_y="center",
+                color=(255, 255, 255, 255),
+            ).draw()
 
     def _draw_badge(self, row, col, level):
         resolution = 6

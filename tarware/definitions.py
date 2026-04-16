@@ -29,4 +29,5 @@ class CollisionLayers(IntEnum):
     AGVS = 0
     PICKERS = 1
     SHELVES = 2
+    # TODO: Remove this layer, as it is just an AGV
     CARRIED_SHELVES = 3

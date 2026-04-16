@@ -46,8 +46,6 @@ _PICKER_WALKABLE_TILES = {3, 4, 6}
 _SHARED_HIGHWAY_TILE = 6
 BIN_VOLUME_FT3 = 2.68
 BIN_USABLE_FRACTION = 0.85
-BIN_LEVELS_PER_SIDE = 5
-BINS_PER_LEVEL = 5
 
 
 class BinCellType(Enum):
@@ -56,34 +54,33 @@ class BinCellType(Enum):
     REPLENISHMENT = "replenishment"
 
 
-BIN_SIDES_BY_CELL_TYPE = {
-    BinCellType.STORAGE: 1,
-    BinCellType.PICKERWALL: 1,
-    BinCellType.REPLENISHMENT: 1,
-}
-
-
-@dataclass
+@dataclass(eq=False)
 class LogicalBin:
-    """Physical bin metadata and Stage A2 inventory assignment.
+    """Mobile bin carried one-at-a-time by an AGV.
 
-    Stage A2 assigns one SKU per logical bin and computes quantity from
-    SKU unit cube and usable bin volume. Movement still uses Shelf objects as
-    a bridge until bin-level AGV tasks are implemented.
+    A bin lives in a Shelf slot until an AGV picks it up, is carried to a
+    destination shelf (pickerwall / replenishment / storage), and is then
+    deposited into a free slot there. SKU + quantity track inventory inside
+    the bin; volume fields cap how much stock the bin can hold.
+
+    ``shelf_id`` / ``slot_index`` are set while the bin is resting in a
+    shelf and cleared while the bin is being carried by an AGV.
     """
     id: int
-    cell_id: int
     x: int
     y: int
-    cell_type: BinCellType
-    side: int
-    level: int
-    slot: int
+    cell_type: BinCellType          # type of the shelf this bin was spawned in
     volume_ft3: float
     usable_fraction: float
     sku: Optional[int] = None
     quantity: int = 0
     used_volume_ft3: float = 0.0
+    shelf_id: Optional[int] = None
+    slot_index: Optional[int] = None
+    depleted: bool = False
+    fulfilled: bool = False
+    from_replenishment: bool = False  # True for a bin that has just been spawned at replenishment
+    on_grid: bool = True              # False once the bin has been retired from circulation
 
     @property
     def usable_volume_ft3(self) -> float:
@@ -93,23 +90,9 @@ class LogicalBin:
     def remaining_volume_ft3(self) -> float:
         return max(0.0, self.usable_volume_ft3 - self.used_volume_ft3)
 
-
-@dataclass
-class BinCell:
-    """Fixed map cell that contains a conglomerate of logical bins."""
-    id: int
-    x: int
-    y: int
-    cell_type: BinCellType
-    bins: List[LogicalBin]
-
     @property
-    def bin_count(self) -> int:
-        return len(self.bins)
-
-    @property
-    def usable_volume_ft3(self) -> float:
-        return sum(bin_.usable_volume_ft3 for bin_ in self.bins)
+    def on_shelf(self) -> bool:
+        return self.shelf_id is not None
 
 class Entity:
     def __init__(self, id_: int, x: int, y: int):
@@ -127,7 +110,7 @@ class Agent(Entity):
         super().__init__(Agent.counter, x, y)
         self.dir = dir_
         self.req_action: Optional[Action] = None
-        self.carrying_shelf: Optional[Shelf] = None
+        self.carrying_bin: Optional["LogicalBin"] = None
         self.canceled_action = None
         self.has_delivered = False
         self.path = None
@@ -164,20 +147,65 @@ class Agent(Entity):
             return self.dir
 
 class Shelf(Entity):
-    counter = 0
-    DEFAULT_CAPACITY = 10
+    """Static shelf fixture with a fixed number of bin slots.
 
-    def __init__(self, x, y):
+    A shelf is pinned to one grid cell for the lifetime of the warehouse.
+    Bins move in and out of its slots via ``place_bin`` / ``remove_bin``;
+    the shelf itself never moves. Storage, pickerwall, and replenishment
+    cells are all represented as Shelf instances distinguished by
+    ``cell_type``.
+    """
+    counter = 0
+
+    def __init__(self, x: int, y: int, cell_type: "BinCellType", num_slots: int):
         Shelf.counter += 1
         super().__init__(Shelf.counter, x, y)
-        self.sku: Optional[int] = None  # assigned by OrderSequencer.initialize_shelf_sku_map
-        self.capacity: int = Shelf.DEFAULT_CAPACITY   # remaining stock units
-        self.initial_capacity: int = Shelf.DEFAULT_CAPACITY
-        self.fulfilled: bool = False  # True once all orders referencing this pickerwall shelf have been picked
-        self.depleted: bool = False        # stock hit 0; shelf should be removed when returned
-        self.on_grid: bool = True          # False after a depleted shelf is removed from the warehouse
-        self.from_replenishment: bool = False  # spawned in the replenishment zone
-        self.bin_id: Optional[int] = None  # Stage A2 bridge to the representative logical bin
+        self.cell_type: "BinCellType" = cell_type
+        self.bin_slots: List[Optional["LogicalBin"]] = [None] * num_slots
+
+    @property
+    def num_slots(self) -> int:
+        return len(self.bin_slots)
+
+    @property
+    def bin_count(self) -> int:
+        return sum(1 for b in self.bin_slots if b is not None)
+
+    @property
+    def is_full(self) -> bool:
+        return all(b is not None for b in self.bin_slots)
+
+    @property
+    def is_empty(self) -> bool:
+        return all(b is None for b in self.bin_slots)
+
+    def first_empty_slot(self) -> Optional[int]:
+        for i, b in enumerate(self.bin_slots):
+            if b is None:
+                return i
+        return None
+
+    def place_bin(self, bin_: "LogicalBin", slot_index: Optional[int] = None) -> int:
+        if slot_index is None:
+            slot_index = self.first_empty_slot()
+        assert slot_index is not None, f"shelf {self.id} is full"
+        assert self.bin_slots[slot_index] is None, (
+            f"shelf {self.id} slot {slot_index} already occupied"
+        )
+        self.bin_slots[slot_index] = bin_
+        bin_.shelf_id = self.id
+        bin_.slot_index = slot_index
+        bin_.x = self.x
+        bin_.y = self.y
+        return slot_index
+
+    def remove_bin(self, slot_index: int) -> "LogicalBin":
+        bin_ = self.bin_slots[slot_index]
+        assert bin_ is not None, f"shelf {self.id} slot {slot_index} is empty"
+        self.bin_slots[slot_index] = None
+        bin_.shelf_id = None
+        bin_.slot_index = None
+        return bin_
 
 class StuckCounter:
     def __init__(self, position: Tuple[int, int]):
@@ -209,7 +237,7 @@ class PickerState(Enum):
 @dataclass
 class PickerClaim:
     """One SKU-quantity claim a picker has taken from the pending request queue."""
-    shelf_id: int          # pickerwall shelf_id to visit; -1 if not yet at pickerwall
+    bin_id: int            # id of the LogicalBin to pick from; -1 if not yet at pickerwall
     sku_entry: "SKUEntry"  # which SKU and how many units to pick
     order_number: str      # which order this fulfils
     order: "Order"         # full Order object (needed for packaging slot setup)
@@ -240,10 +268,10 @@ class Picker(Entity):
         self.state: PickerState = PickerState.IDLE
         self.task: Optional[PickerTask] = None
         self.path: List = []
-        self.pick_ticks_remaining: int = 0
+        self.pick_ticks_remaining: int = 0    # counts down the steps spent picking the current claim's SKU; set to 0 when not actively picking
         self.capacity: int = Picker.CAPACITY
-        self.blocked_ticks: int = 0   # consecutive steps spent waiting on a blocked cell
-        self.fixing_clash: int = 0    # cooldown after rerouting; mirrors Agent.fixing_clash
+        self.blocked_ticks: int = 0           # consecutive steps spent waiting on a blocked cell
+        self.fixing_clash: int = 0            # cooldown after rerouting; mirrors Agent.fixing_clash
         self.home_zone: Optional[int] = None
         self.stalled: bool = False
         self.packaging_location: Optional[Tuple[int, int]] = None
@@ -316,8 +344,8 @@ class Warehouse(gym.Env):
         self.observation_space_mapper = observation_map[observation_type](
             self.num_agvs,
             self.grid_size,
-            len(self.action_id_to_coords_map)-len(self.goals),
-            len(self.goals),
+            self.num_non_goal_actions,
+            self.num_pickerwall_actions,
             normalised_coordinates,
         )
         self.observation_space = spaces.Tuple(tuple(self.observation_space_mapper.ma_spaces))
@@ -325,18 +353,22 @@ class Warehouse(gym.Env):
         self.request_queue_size = request_queue_size
         self.request_queue = []
         self._step_deliveries = 0
-        
-        self.rack_groups = find_sections(list([loc for loc in self.action_id_to_coords_map.values() if (loc[1], loc[0]) not in self.goals]))
+
+        # rack_groups clusters physical rack cells; dedupe the per-slot action entries.
+        self.rack_groups = find_sections(
+            [(r, c) for (r, c) in self.shelf_locs]
+            + [(y, x) for (x, y) in self.replenishment_locs]
+        )
         self.agents: List[Agent] = []
         self.pickers: List[Picker] = []
         self.stuck_counters = []
         self.renderer = None
-        self._shelf_to_order: Dict[int, Any] = {}  # shelf_id -> Order that triggered its fetch
+        self._bin_to_order: Dict[int, Any] = {}  # bin_id -> Order that triggered its fetch
         self._packaging_slots: Dict[str, Dict[str, Any]] = {}  # order_number -> {required, delivered, station}
-        self._pickerwall_pending: deque = deque()  # (shelf_id, SKUEntry, Order) populated on delivery
-        self._pickerwall_slot_by_shelf_id: Dict[int, int] = {}
-        self._replenishment_slot_by_shelf_id: Dict[int, int] = {}
-        self._slot_occupancy_by_slot_id: Dict[int, int] = {}
+        self._pickerwall_pending: deque = deque()  # (bin_id, SKUEntry, Order) populated on delivery
+        self._reserved_slots: Dict[Tuple[int, int], int] = {}  # (shelf_id, slot_idx) -> bin_id
+        self._next_bin_id: int = 0
+        self._bins_by_id: Dict[int, "LogicalBin"] = {}
         self._picker_hf_profile_by_id: Dict[int, PickerEffortProfile] = {}
         self._picker_hf_state_by_id: Dict[int, PickerHumanFactorsState] = {}
         self._picker_hf_episode_delay_steps = 0
@@ -414,94 +446,41 @@ class Warehouse(gym.Env):
             "Warehouse: built OrderSequencer from path=%s", order_csv_path
         )
 
-    def _make_bin_cell(
-        self,
-        cell_id: int,
-        x: int,
-        y: int,
-        cell_type: BinCellType,
-        first_bin_id: int,
-    ) -> BinCell:
-        """Build the logical bin conglomerate for one fixed map cell."""
-        bins: List[LogicalBin] = []
-        sides = BIN_SIDES_BY_CELL_TYPE[cell_type]
-        for side in range(sides):
-            for level in range(BIN_LEVELS_PER_SIDE):
-                for slot in range(BINS_PER_LEVEL):
-                    bins.append(
-                        LogicalBin(
-                            id=first_bin_id + len(bins),
-                            cell_id=cell_id,
-                            x=x,
-                            y=y,
-                            cell_type=cell_type,
-                            side=side,
-                            level=level,
-                            slot=slot,
-                            volume_ft3=self.bin_volume_ft3,
-                            usable_fraction=self.bin_usable_fraction,
-                        )
-                    )
-        return BinCell(
-            id=cell_id,
-            x=x,
-            y=y,
-            cell_type=cell_type,
-            bins=bins,
-        )
+    def _make_shelves(self) -> None:
+        """Create static Shelf fixtures for every storage, pickerwall, and
+        replenishment cell in the map.
 
-    def _make_bin_cells(self) -> None:
-        """Create Stage A1 logical bin metadata for storage-like map cells."""
-        self.bin_cells: List[BinCell] = []
-        self.bin_cells_by_xy: Dict[Tuple[int, int], BinCell] = {}
-        next_bin_id = 1
+        Each shelf has ``self.bins_per_shelf`` empty bin slots. Bins are
+        not created here — they are populated later by the inventory
+        initialisation step, one LogicalBin per assigned SKU, placed into
+        storage shelf slots.
+        """
+        Shelf.counter = 0
+        self.shelfs: List[Shelf] = []
+        self.shelves_by_xy: Dict[Tuple[int, int], Shelf] = {}
+        self.shelves_by_id: Dict[int, Shelf] = {}
 
-        def add_cell(x: int, y: int, cell_type: BinCellType) -> None:
-            nonlocal next_bin_id
-            cell = self._make_bin_cell(
-                len(self.bin_cells) + 1,
-                x,
-                y,
-                cell_type,
-                next_bin_id,
-            )
-            next_bin_id += len(cell.bins)
-            self.bin_cells.append(cell)
-            self.bin_cells_by_xy[(x, y)] = cell
+        def add_shelf(x: int, y: int, cell_type: BinCellType) -> None:
+            shelf = Shelf(x, y, cell_type, self.bins_per_shelf)
+            self.shelfs.append(shelf)
+            self.shelves_by_xy[(x, y)] = shelf
+            self.shelves_by_id[shelf.id] = shelf
 
         for row, col in self.shelf_locs:
-            add_cell(col, row, BinCellType.STORAGE)
+            add_shelf(col, row, BinCellType.STORAGE)
         for x, y in self.goals:
-            add_cell(x, y, BinCellType.PICKERWALL)
+            add_shelf(x, y, BinCellType.PICKERWALL)
         for x, y in self.replenishment_locs:
-            add_cell(x, y, BinCellType.REPLENISHMENT)
+            add_shelf(x, y, BinCellType.REPLENISHMENT)
 
-        self.logical_bins: List[LogicalBin] = [
-            bin_
-            for cell in self.bin_cells
-            for bin_ in cell.bins
+        self.storage_shelves: List[Shelf] = [
+            s for s in self.shelfs if s.cell_type == BinCellType.STORAGE
         ]
-        self.logical_bins_by_id: Dict[int, LogicalBin] = {
-            bin_.id: bin_
-            for bin_ in self.logical_bins
-        }
-        self.storage_logical_bins: List[LogicalBin] = [
-            bin_
-            for cell in self.bin_cells
-            if cell.cell_type == BinCellType.STORAGE
-            for bin_ in cell.bins
+        self.pickerwall_shelves: List[Shelf] = [
+            s for s in self.shelfs if s.cell_type == BinCellType.PICKERWALL
         ]
-        self.pickerwall_logical_bins: List[LogicalBin] = [
-            bin_
-            for cell in self.bin_cells
-            if cell.cell_type == BinCellType.PICKERWALL
-            for bin_ in cell.bins
-        ]
-        self.replenishment_logical_bins: List[LogicalBin] = [
-            bin_
-            for cell in self.bin_cells
-            if cell.cell_type == BinCellType.REPLENISHMENT
-            for bin_ in cell.bins
+        self.replenishment_shelves: List[Shelf] = [
+            s for s in self.shelfs if s.cell_type == BinCellType.REPLENISHMENT
         ]
 
     def _make_layout_from_csv(self, map_csv_path: Path, map_json_path: Path, fit_width: Optional[int] = None, fit_height: Optional[int] = None) -> None:
@@ -517,17 +496,8 @@ class Warehouse(gym.Env):
 
         with open(map_json_path, "r") as f:
             map_data = json.load(f)
-        bins_per_shelf = map_data["bins_per_shelf"]
+        self.bins_per_shelf: int = int(map_data["bins_per_shelf"])
 
-        # AGV zone ends at the last row containing any AGV-side tile.
-        agv_zone_height = num_rows
-        for r in range(num_rows - 1, -1, -1):
-            if any(tile_grid[r, c] in (0, 1, 2, 5, 6) for c in range(num_cols)):
-                agv_zone_height = r + 1
-                break
-        picker_zone_rows = num_rows - agv_zone_height
-        self._picker_zone_rows = picker_zone_rows
-        self.agv_zone_height = agv_zone_height
         self.grid_size = (num_rows, num_cols)
         self.grid = np.zeros((len(CollisionLayers), *self.grid_size), dtype=np.int32)
 
@@ -541,7 +511,6 @@ class Warehouse(gym.Env):
                     self.highways[r, c] = 1
                 if t in _PICKER_WALKABLE_TILES:
                     self.picker_highways[r, c] = 1
-
         self.shared_highway_locs: List[Tuple[int, int]] = [
             (c, r)
             for r in range(num_rows)
@@ -565,7 +534,6 @@ class Warehouse(gym.Env):
             for c in range(num_cols)
             if tile_grid[r, c] == 4
         ]
-
         packaging_set = set(self.packaging_locations)
 
         # Shelf cells: column-major ordering
@@ -586,7 +554,7 @@ class Warehouse(gym.Env):
             if tile_grid[r, c] == 5
         ]
         self._replenishment_locs_set: set = set(self.replenishment_locs)
-        self._make_bin_cells()
+        self._make_shelves()
 
         self.agv_spawn_locs = np.argwhere(self.highways == 1)  # (row, col)
 
@@ -619,26 +587,59 @@ class Warehouse(gym.Env):
                 for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)]
                 if 0 <= ny < num_rows and 0 <= nx < num_cols
                 and self.highways[ny, nx] == 1       # AGV-walkable
-                and (nx, ny) not in self.goals        # not another goal slot
             ]
             self._goal_to_agv_entry[(gx, gy)] = entries
 
-        # Reverse: AGV-entry (col, row) → goal (col, row)
+        # Reverse: AGV-entry (col, row) -> goal (col, row)
         self._agv_entry_to_goal: Dict[Tuple[int, int], Tuple[int, int]] = {}
         for goal_xy, entries in self._goal_to_agv_entry.items():
             for entry_xy in entries:
                 self._agv_entry_to_goal[entry_xy] = goal_xy
 
-        # Action IDs: 1..num_goals (pickerwall), then storage, then replenishment
-        self.action_id_to_coords_map = {i + 1: (r, c) for i, (c, r) in enumerate(self.goals)}
-        item_loc_index = len(self.action_id_to_coords_map) + 1
+        # Action IDs: one action per bin slot, in order:
+        #   pickerwall slots, then storage slots, then replenishment slots.
+        # action_id_to_coords_map: action_id -> (row, col) of the containing shelf cell
+        # action_id_to_slot:       action_id -> (shelf_id, slot_index)
+        self.action_id_to_coords_map: Dict[int, Tuple[int, int]] = {}
+        self.action_id_to_slot: Dict[int, Tuple[int, int]] = {}
+
+        action_id = 1
+        self._pickerwall_action_id_base = action_id
+        for (x, y) in self.goals:
+            shelf = self.shelves_by_xy[(x, y)]
+            # Define 1 action per slot in each pickerwall shelf
+            for slot_idx in range(self.bins_per_shelf):
+                self.action_id_to_coords_map[action_id] = (y, x)
+                self.action_id_to_slot[action_id] = (shelf.id, slot_idx)
+                action_id += 1
+        self.num_pickerwall_actions = action_id - self._pickerwall_action_id_base
+
+        self._storage_action_id_base = action_id
         for (r, c) in self.shelf_locs:
-            self.action_id_to_coords_map[item_loc_index] = (r, c)
-            item_loc_index += 1
-        self._replenishment_action_id_base = item_loc_index
+            shelf = self.shelves_by_xy[(c, r)]
+            # Define 1 action per slot in each storage shelf
+            for slot_idx in range(self.bins_per_shelf):
+                self.action_id_to_coords_map[action_id] = (r, c)
+                self.action_id_to_slot[action_id] = (shelf.id, slot_idx)
+                action_id += 1
+        self.num_storage_actions = action_id - self._storage_action_id_base
+
+        self._replenishment_action_id_base = action_id
         for (x, y) in self.replenishment_locs:
-            self.action_id_to_coords_map[item_loc_index] = (y, x)  # stored as (row, col)
-            item_loc_index += 1
+            shelf = self.shelves_by_xy[(x, y)]
+            # Define 1 action per slot in each replenishment shelf
+            for slot_idx in range(self.bins_per_shelf):
+                self.action_id_to_coords_map[action_id] = (y, x)
+                self.action_id_to_slot[action_id] = (shelf.id, slot_idx)
+                action_id += 1
+        self.num_replenishment_actions = action_id - self._replenishment_action_id_base
+        self.num_non_goal_actions = self.num_storage_actions + self.num_replenishment_actions
+
+        # Reverse lookup: (shelf_id, slot_idx) -> action_id. Needed by the heuristic
+        # to target a specific bin slot rather than collapsing by cell.
+        self.slot_to_action_id: Dict[Tuple[int, int], int] = {
+            slot: aid for aid, slot in self.action_id_to_slot.items()
+        }
 
         # longest shelf column run, used by stuck-agent resolver timeouts
         max_run = 1
@@ -658,19 +659,19 @@ class Warehouse(gym.Env):
             self.render_tile_size = max(4, min((fit_width - 1) // num_cols - 1, (fit_height - 1) // num_rows - 1))
 
         logger.info(
-            "Map loaded from CSV: %s | grid=%s agv_zone=%d picker_zone=%d "
-            "goals=%d shelves=%d replenishment=%d packaging=%d bin_cells=%d "
-            "logical_bins=%d bin_usable_volume_ft3=%.3f column_height=%d",
-            map_csv_path, self.grid_size, agv_zone_height, picker_zone_rows,
-            self.num_goals, len(self.shelf_locs), len(self.replenishment_locs),
-            len(self.packaging_locations), len(self.bin_cells), len(self.logical_bins),
+            "Map loaded from CSV: %s | grid=%s "
+            "goals=%d storage_shelves=%d replenishment_shelves=%d packaging=%d "
+            "total_shelves=%d bins_per_shelf=%d bin_usable_volume_ft3=%.3f column_height=%d",
+            map_csv_path, self.grid_size,
+            self.num_goals, len(self.storage_shelves), len(self.replenishment_shelves),
+            len(self.packaging_locations), len(self.shelfs), self.bins_per_shelf,
             self.bin_volume_ft3 * self.bin_usable_fraction, self.column_height,
         )
 
     def _is_highway(self, x: int, y: int) -> bool:
         return self.highways[y, x]
 
-    def find_agv_path(self, start, goal: Tuple[int], agent: Tuple[int], care_for_agents: bool = True) -> List[Tuple[int]]:
+    def find_agv_path(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for an AGV on the highway grid. Returns [] if no path exists."""
         grid = np.zeros(self.grid_size)
         if care_for_agents:
@@ -698,7 +699,7 @@ class Warehouse(gym.Env):
         else:
             return []
         
-    def find_agv_path_through_adjacent_loc(self, start, goal: Tuple[int], agent: Tuple[int], care_for_agents: bool = True) -> List[Tuple[int]]:
+    def find_agv_path_through_adjacent_loc(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """Find path from start to goal that goes through via. Returns [] if no path exists."""
         gr, gc = goal
         rows, cols = self.grid_size
@@ -713,7 +714,7 @@ class Warehouse(gym.Env):
         best_via = None
         best_path: List[Tuple[int, int]] = []
         for entry_rc in entries:
-            p = self.find_agv_path(start, entry_rc, agent, care_for_agents)
+            p = self.find_agv_path(start, entry_rc, care_for_agents)
             if p and (not best_path or len(p) < len(best_path)):
                 best_via = entry_rc
                 best_path = p
@@ -721,13 +722,12 @@ class Warehouse(gym.Env):
         path_to_via = best_path
         if not path_to_via:
             return []
-        path_from_via = self.find_agv_path(via, goal, agent, care_for_agents)
+        path_from_via = self.find_agv_path(via, goal, care_for_agents)
         if not path_from_via:
             return []
         return path_to_via + path_from_via
     
-    def find_agv_path_to_target_entry(self, start: Tuple[int, int], target_rc: Tuple[int, int],
-                                      agent: "Agent", care_for_agents: bool = True) -> List[Tuple[int, int]]:
+    def find_agv_path_to_target_entry(self, start: Tuple[int, int], target_rc: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """Route an AGV to the nearest highway cell adjacent to target_rc (row, col).
 
         Used when the target is a non-highway cell (shelf tile 1) so the AGV
@@ -747,13 +747,12 @@ class Warehouse(gym.Env):
         ]
         best_path: List[Tuple[int, int]] = []
         for entry_rc in entries:
-            p = self.find_agv_path(start, entry_rc, agent, care_for_agents)
+            p = self.find_agv_path(start, entry_rc, care_for_agents)
             if p and (not best_path or len(p) < len(best_path)):
                 best_path = p
         return best_path
 
-    def find_agv_path_to_goal_entry(self, start: Tuple[int, int], goal_xy: Tuple[int, int],
-                                    agent: "Agent", care_for_agents: bool = True) -> List[Tuple[int, int]]:
+    def find_agv_path_to_goal_entry(self, start: Tuple[int, int], goal_xy: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """Route an AGV to the nearest highway cell adjacent to goal_xy (col, row).
 
         Used for side drop-off: the AGV stops at a highway cell next to the
@@ -763,12 +762,12 @@ class Warehouse(gym.Env):
         entries = self._goal_to_agv_entry.get(goal_xy, [])
         best_path: List[Tuple[int, int]] = []
         for (ex, ey) in entries:          # entries stored as (col, row)
-            p = self.find_agv_path(start, (ey, ex), agent, care_for_agents)
+            p = self.find_agv_path(start, (ey, ex), care_for_agents)
             if p and (not best_path or len(p) < len(best_path)):
                 best_path = p
         return best_path
 
-    def find_picker_path(self, start, goal: Tuple[int, int], picker: "Picker", care_for_agents: bool = True) -> List[Tuple[int, int]]:
+    def find_picker_path(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for a picker on picker_highways. Returns [] if no path exists."""
         grid = np.zeros(self.grid_size)
         if care_for_agents:
@@ -796,85 +795,78 @@ class Warehouse(gym.Env):
     def _recalc_grid(self) -> None:
         self.grid.fill(0)
 
-        carried_shelf_ids = {agent.carrying_shelf.id for agent in self.agents if agent.carrying_shelf}
+        # Shelves are static fixtures: they always occupy their cells.
         for shelf in self.shelfs:
-            if shelf.on_grid and shelf.id not in carried_shelf_ids:
-                self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] = shelf.id
+            self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] = shelf.id
         for agent in self.agents:
             self.grid[CollisionLayers.AGVS, agent.y, agent.x] = agent.id
-            if agent.carrying_shelf:
-                self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = agent.carrying_shelf.id
+            if agent.carrying_bin:
+                self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = agent.carrying_bin.id
         for picker in self.pickers:
             self.grid[CollisionLayers.PICKERS, picker.y, picker.x] = picker.id
 
-    def get_carrying_shelf_information(self):
-        return [agent.carrying_shelf != None for agent in self.agents[:self.num_agvs]]
+    def get_carrying_bin_information(self):
+        return [agent.carrying_bin != None for agent in self.agents[:self.num_agvs]]
 
     def get_shelf_request_information(self) -> np.ndarray[int]:
-        n_non_goal = len(self.action_id_to_coords_map) - self.num_goals
-        request_item_map = np.zeros(n_non_goal)
-        requested_shelf_ids = [shelf.id for shelf in self.request_queue]
-        for id_, coords in self.action_id_to_coords_map.items():
-            if (coords[1], coords[0]) not in self.goals:
-                if self.grid[CollisionLayers.SHELVES, coords[0], coords[1]] in requested_shelf_ids:
-                    request_item_map[id_ - self.num_goals - 1] = 1
+        """Per non-pickerwall slot: 1 if the bin in that slot is currently requested."""
+        request_item_map = np.zeros(self.num_non_goal_actions, dtype=np.int32)
+        requested_bin_ids = {getattr(item, "id", None) for item in self.request_queue}
+        for action_id, (shelf_id, slot_idx) in self.action_id_to_slot.items():
+            if action_id < self._storage_action_id_base:
+                continue
+            shelf = self.shelves_by_id[shelf_id]
+            bin_ = shelf.bin_slots[slot_idx]
+            if bin_ is not None and bin_.id in requested_bin_ids:
+                request_item_map[action_id - self._storage_action_id_base] = 1
         return request_item_map
 
     def get_empty_shelf_information(self) -> np.ndarray[int]:
-        n_non_goal = len(self.action_id_to_coords_map) - self.num_goals
-        empty_item_map = np.zeros(n_non_goal)
-        for id_, coords in self.action_id_to_coords_map.items():
-            if (coords[1], coords[0]) in self.goals:
+        """Per non-pickerwall slot: 1 if a storage slot is empty (bin can be placed there)."""
+        empty_item_map = np.zeros(self.num_non_goal_actions, dtype=np.int32)
+        for action_id, (shelf_id, slot_idx) in self.action_id_to_slot.items():
+            if action_id < self._storage_action_id_base:
                 continue
-            if (coords[1], coords[0]) in self._replenishment_locs_set:
-                continue  # replenishment zone is take-only; AGVs cannot deposit here
-            if self.grid[CollisionLayers.SHELVES, coords[0], coords[1]] == 0 and (
-                self.grid[CollisionLayers.CARRIED_SHELVES, coords[0], coords[1]] == 0
-                or self.agents[
-                    self.grid[CollisionLayers.AGVS, coords[0], coords[1]] - 1
-                ].req_action
-                not in [Action.NOOP, Action.TOGGLE_LOAD]
-            ):
-                empty_item_map[id_ - self.num_goals - 1] = 1
+            if action_id >= self._replenishment_action_id_base:
+                continue  # replenishment slots handled separately
+            shelf = self.shelves_by_id[shelf_id]
+            if shelf.bin_slots[slot_idx] is None:
+                empty_item_map[action_id - self._storage_action_id_base] = 1
         return empty_item_map
 
     def get_empty_replenishment_information(self) -> np.ndarray[int]:
-        """Returns a boolean array of non-goal action locations free for depleted-bin return."""
-        n_non_goal = len(self.action_id_to_coords_map) - self.num_goals
-        empty_item_map = np.zeros(n_non_goal)
-        for id_, coords in self.action_id_to_coords_map.items():
-            xy = (coords[1], coords[0])
-            if xy not in self._replenishment_locs_set:
+        """Per non-pickerwall slot: 1 if a replenishment slot is empty."""
+        empty_item_map = np.zeros(self.num_non_goal_actions, dtype=np.int32)
+        for action_id, (shelf_id, slot_idx) in self.action_id_to_slot.items():
+            if action_id < self._replenishment_action_id_base:
                 continue
-            if self.grid[CollisionLayers.SHELVES, coords[0], coords[1]] == 0 and (
-                self.grid[CollisionLayers.CARRIED_SHELVES, coords[0], coords[1]] == 0
-                or self.agents[
-                    self.grid[CollisionLayers.AGVS, coords[0], coords[1]] - 1
-                ].req_action
-                not in [Action.NOOP, Action.TOGGLE_LOAD]
-            ):
-                empty_item_map[id_ - self.num_goals - 1] = 1
+            shelf = self.shelves_by_id[shelf_id]
+            if shelf.bin_slots[slot_idx] is None:
+                empty_item_map[action_id - self._storage_action_id_base] = 1
         return empty_item_map
 
     def get_pickerwall_info(self) -> np.ndarray:
-        """Returns a boolean array of length num_goals: 1 where a shelf is deposited at that goal slot."""
-        occupied = np.zeros(self.num_goals, dtype=np.int32)
-        for i, (x, y) in enumerate(self.goals):
-            if self.grid[CollisionLayers.SHELVES, y, x] != 0:
-                occupied[i] = 1
+        """Per pickerwall slot: 1 if a bin is currently parked in that slot."""
+        occupied = np.zeros(self.num_pickerwall_actions, dtype=np.int32)
+        for action_id, (shelf_id, slot_idx) in self.action_id_to_slot.items():
+            if action_id >= self._storage_action_id_base:
+                break
+            shelf = self.shelves_by_id[shelf_id]
+            if shelf.bin_slots[slot_idx] is not None:
+                occupied[action_id - self._pickerwall_action_id_base] = 1
         return occupied
 
     def get_pickerwall_displacement_info(self) -> np.ndarray:
-        """Returns a boolean array of length num_goals: 1 where a pickerwall shelf is fulfilled
-        (all picker claims satisfied) and eligible for AGV displacement back to storage."""
-        displaceable = np.zeros(self.num_goals, dtype=np.int32)
-        for i, (x, y) in enumerate(self.goals):
-            shelf_id = self.grid[CollisionLayers.SHELVES, y, x]
-            if shelf_id == 0:
-                continue
-            shelf = self.shelfs[shelf_id - 1]
-            if shelf.fulfilled:
-                displaceable[i] = 1
+        """Per pickerwall slot: 1 if the bin in that slot is fulfilled and eligible for
+        AGV displacement back to storage / replenishment."""
+        displaceable = np.zeros(self.num_pickerwall_actions, dtype=np.int32)
+        for action_id, (shelf_id, slot_idx) in self.action_id_to_slot.items():
+            if action_id >= self._storage_action_id_base:
+                break
+            shelf = self.shelves_by_id[shelf_id]
+            bin_ = shelf.bin_slots[slot_idx]
+            if bin_ is not None and bin_.fulfilled:
+                displaceable[action_id - self._pickerwall_action_id_base] = 1
         return displaceable
 
     def attribute_macro_actions(self, macro_actions: List[int]) -> int:
@@ -893,35 +885,36 @@ class Warehouse(gym.Env):
                         # Pickerwall target (pick-up or drop-off): approach from adjacent
                         # highway cell so the AGV never enters the tile-2 slot.
                         agent.path = self.find_agv_path_to_goal_entry(
-                            (agent.y, agent.x), target_xy, agent, care_for_agents=True
+                            (agent.y, agent.x), target_xy, care_for_agents=True
                         )
                         if not agent.path:
                             agent.path = self.find_agv_path_to_goal_entry(
-                                (agent.y, agent.x), target_xy, agent, care_for_agents=False
+                                (agent.y, agent.x), target_xy, care_for_agents=False
                             )
                     elif not self._is_highway(target_rc[1], target_rc[0]):
                         # Non-highway target (shelf tile): approach from an adjacent
                         # highway cell so the AGV never enters the shelf cell directly.
                         agent.path = self.find_agv_path_to_target_entry(
-                            (agent.y, agent.x), target_rc, agent, care_for_agents=True
+                            (agent.y, agent.x), target_rc, care_for_agents=True
                         )
                         if not agent.path:
                             agent.path = self.find_agv_path_to_target_entry(
-                                (agent.y, agent.x), target_rc, agent, care_for_agents=False
+                                (agent.y, agent.x), target_rc, care_for_agents=False
                             )
                     else:
-                        agent.path = self.find_agv_path((agent.y, agent.x), target_rc, agent, care_for_agents=True)
+                        agent.path = self.find_agv_path((agent.y, agent.x), target_rc, care_for_agents=True)
                         if not agent.path:
                             # Congestion blocked the agent-aware path; fall back to ignoring agents
                             # so the agent can at least start moving. resolve_move_conflict handles
                             # any resulting step-level collisions.
-                            agent.path = self.find_agv_path((agent.y, agent.x), target_rc, agent, care_for_agents=False)
+                            agent.path = self.find_agv_path((agent.y, agent.x), target_rc, care_for_agents=False)
 
                     if agent.path:
                         agent.busy = True
                         agent.target = macro_action
                         agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
                         if agent.req_action == Action.FORWARD:
+                            # Check if the agent has enough credit to move (e.g. due to configured speed)
                             can_move = self._consume_motion_credit(
                                 agent,
                                 self._agv_cells_per_step_effective,
@@ -958,6 +951,7 @@ class Warehouse(gym.Env):
                 else:
                     agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
                     if agent.req_action == Action.FORWARD:
+                        # Check if the agent has enough credit to move (e.g. due to configured speed)
                         can_move = self._consume_motion_credit(
                             agent,
                             self._agv_cells_per_step_effective,
@@ -967,13 +961,15 @@ class Warehouse(gym.Env):
                         else:
                             agent.req_action = Action.NOOP
                             agent.speed_limited_this_step = True
-                if len(agent.path) == 1 and agent.carrying_shelf:
-                    # If the deposit target is already occupied by a resting shelf, abort.
-                    # The deposit target is the action target cell, not the entry cell.
-                    target_rc = self.action_id_to_coords_map.get(agent.target)
-                    if target_rc is not None:
-                        tx, ty = target_rc[1], target_rc[0]
-                        if self.grid[CollisionLayers.SHELVES, ty, tx]:
+                if len(agent.path) == 1 and agent.carrying_bin:
+                    slot = self.action_id_to_slot.get(agent.target)
+                    if slot is not None:
+                        shelf_id, slot_idx = slot
+                        shelf = self.shelves_by_id.get(shelf_id)
+                        reserver = self._reserved_slots.get((shelf_id, slot_idx))
+                        occupied = shelf is not None and shelf.bin_slots[slot_idx] is not None
+                        stolen = reserver is not None and reserver != agent.carrying_bin.id
+                        if occupied or stolen:
                             agent.req_action = Action.NOOP
                             agent.busy = False
         return agvs_distance_travelled
@@ -1017,11 +1013,11 @@ class Warehouse(gym.Env):
                                 if other.fixing_clash == 0:
                                     clashes+=1
                                     agent.fixing_clash = _FIXING_CLASH_TIME
-                                    new_path = self.find_agv_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent, True)
+                                    new_path = self.find_agv_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), True)
                                     if len(new_path) == 1:
                                         # Agents that are stuck and are 1 cell away from their target are likely competing with an AGV that has
                                         # the same dilemma, so, re-route agent to the target through an adjacent cell to the target.
-                                        new_path = self.find_agv_path_through_adjacent_loc((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent, True)
+                                        new_path = self.find_agv_path_through_adjacent_loc((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), True)
                                     if new_path != []:
                                         agent.path = new_path
                                     else:
@@ -1073,7 +1069,6 @@ class Warehouse(gym.Env):
                 new_path = self.find_agv_path(
                     (agent.y, agent.x),
                     (agent.path[-1][1], agent.path[-1][0]),
-                    agent,
                     care_for_agents=True,
                 )
                 if new_path:
@@ -1103,66 +1098,59 @@ class Warehouse(gym.Env):
     def _execute_forward(self, agent: Agent) -> None:
         agent.x, agent.y = agent.req_location(self.grid_size)
         agent.path = agent.path[1:]
-        if agent.carrying_shelf:
-            agent.carrying_shelf.x, agent.carrying_shelf.y = agent.x, agent.y
+        if agent.carrying_bin:
+            agent.carrying_bin.x, agent.carrying_bin.y = agent.x, agent.y
 
     def _execute_rotation(self, agent: Agent) -> None:
         agent.dir = agent.req_direction()
 
     def _execute_load(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        # Determine which cell the shelf is in.  If the agent is adjacent to its
-        # target (side pick-up from shelf rack or pickerwall), look there;
-        # otherwise fall back to the agent's own cell (legacy / replenishment).
-        load_x, load_y = agent.x, agent.y
-        target_rc = self.action_id_to_coords_map.get(agent.target)
-        if target_rc is not None:
-            tx, ty = target_rc[1], target_rc[0]  # (col, row)
-            if abs(tx - agent.x) + abs(ty - agent.y) == 1:
-                load_x, load_y = tx, ty
-
-        shelf_id = self.grid[CollisionLayers.SHELVES, load_y, load_x]
-        if shelf_id:
-            agent.carrying_shelf = self.shelfs[shelf_id - 1]
-            self.grid[CollisionLayers.SHELVES, load_y, load_x] = 0
-            self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = shelf_id
-            self._release_reserved_slot_for_shelf(agent.carrying_shelf)
-            if (load_x, load_y) in self._replenishment_locs_set:
-                agent.carrying_shelf.from_replenishment = False
+        """Pick up the bin at agent.target's (shelf_id, slot_idx)."""
+        slot = self.action_id_to_slot.get(agent.target)
+        if slot is None:
             agent.busy = False
-            if self.reward_type == RewardType.GLOBAL:
-                rewards += 0.5
-            elif self.reward_type == RewardType.INDIVIDUAL:
-                rewards[agent.id - 1] += 0.1
-        else:
+            return rewards
+        shelf_id, slot_idx = slot
+        shelf = self.shelves_by_id.get(shelf_id)
+        if shelf is None:
             agent.busy = False
-        return rewards
-
-    def _deliver_to_pickerwall(self, agent: Agent, gx: int, gy: int,
-                               rewards: np.ndarray[int]) -> np.ndarray[int]:
-        """Place the shelf carried by *agent* into pickerwall slot (gx, gy) and
-        update the request queue and picker-wall pending list.  The agent must
-        already be at its final cell (entry or goal) when this is called."""
-        shelf = agent.carrying_shelf
-        # A shelf delivered to pickerwall is now active work and must not be
-        # considered displaceable due to stale fulfilled state from prior cycles.
-        shelf.fulfilled = False
-        if not self._reserve_cell_slot_for_shelf(shelf, gx, gy, BinCellType.PICKERWALL):
-            logger.warning(
-                "step=%d delivery blocked: no pickerwall bin slot for shelf_id=%d at (%d,%d)",
-                self._cur_steps, shelf.id, gx, gy,
-            )
+            return rewards
+        bin_ = shelf.bin_slots[slot_idx]
+        if bin_ is None:
             agent.busy = False
             return rewards
 
-        self.grid[CollisionLayers.SHELVES, gy, gx] = shelf.id
+        shelf.remove_bin(slot_idx)
+
+        agent.carrying_bin = bin_
+        bin_.x, bin_.y = agent.x, agent.y
+        self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = bin_.id
+        self._release_reserved_slot_for_bin(bin_)
+        if shelf.cell_type == BinCellType.REPLENISHMENT:
+            bin_.from_replenishment = False
+        agent.busy = False
+        if self.reward_type == RewardType.GLOBAL:
+            rewards += 0.5
+        elif self.reward_type == RewardType.INDIVIDUAL:
+            rewards[agent.id - 1] += 0.1
+        return rewards
+
+    def _deliver_to_pickerwall(self, agent: Agent, pickerwall_shelf: "Shelf",
+                               slot_idx: int, rewards: np.ndarray[int]) -> np.ndarray[int]:
+        """Place the bin carried by *agent* into a pickerwall shelf slot."""
+        bin_ = agent.carrying_bin
+        if pickerwall_shelf.bin_slots[slot_idx] is not None:
+            agent.busy = False
+            return rewards
+        bin_.fulfilled = False
+        pickerwall_shelf.place_bin(bin_, slot_idx)
+        self._release_reserved_slot_for_bin(bin_)
         self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-        shelf.x, shelf.y = gx, gy
-        agent.carrying_shelf = None
+        agent.carrying_bin = None
         agent.busy = False
         agent.has_delivered = False
 
-        if shelf not in self.request_queue:
-            self._release_reserved_slot_for_shelf(shelf)
+        if bin_ not in self.request_queue:
             return rewards
 
         if self.reward_type == RewardType.GLOBAL:
@@ -1170,160 +1158,124 @@ class Warehouse(gym.Env):
         elif self.reward_type == RewardType.INDIVIDUAL:
             rewards[agent.id - 1] += 1
 
-        carried_shelves = {a.carrying_shelf for a in self.agents if a.carrying_shelf}
-        pickerwall_shelf_ids = {
-            self.grid[CollisionLayers.SHELVES, yy, xx]
-            for (xx, yy) in self.goals
-            if self.grid[CollisionLayers.SHELVES, yy, xx] != 0
-        }
-        pickerwall_shelves = {self.shelfs[sid - 1] for sid in pickerwall_shelf_ids}
-        new_shelf_candidates = [
-            s for s in self.shelfs
-            if s.on_grid
-            and s not in self.request_queue
-            and s not in carried_shelves
-            and s not in pickerwall_shelves
-        ]
-        new_shelf_candidates.sort(key=lambda s: s.id)
-        delivered_order = self._shelf_to_order.pop(shelf.id, None)
+        delivered_order = self._bin_to_order.pop(bin_.id, None)
         if delivered_order is not None:
             matched_sku_entry = next(
-                (se for se in delivered_order.skus if se.sku == shelf.sku), None
+                (se for se in delivered_order.skus if se.sku == bin_.sku), None
             )
             if matched_sku_entry is not None and self.num_pickers > 0:
-                self._pickerwall_pending.append((shelf.id, matched_sku_entry, delivered_order))
+                self._pickerwall_pending.append((bin_.id, matched_sku_entry, delivered_order))
             logger.info(
-                "step=%d delivery: shelf_id=%d sku=%d arrived for order=%s "
+                "step=%d delivery: bin_id=%d sku=%s arrived for order=%s "
                 "(pickerwall_pending=%d)",
-                self._cur_steps, shelf.id, shelf.sku, delivered_order.order_number,
+                self._cur_steps, bin_.id, bin_.sku, delivered_order.order_number,
                 len(self._pickerwall_pending),
             )
 
-        result = self.order_sequencer.next_order_shelf(new_shelf_candidates)
+        new_candidates = self._storage_bin_candidates()
+        result = self.order_sequencer.next_order_bin(new_candidates)
         if result is not None:
-            new_request, new_order = result
-            self._shelf_to_order[new_request.id] = new_order
+            new_bin, new_order = result
+            self._bin_to_order[new_bin.id] = new_order
             logger.info(
-                "step=%d delivery: shelf_id=%d sku=%s delivered - "
-                "replaced in queue with shelf_id=%d sku=%d "
-                "(pending=%d active=%d)",
-                self._cur_steps, shelf.id, shelf.sku,
-                new_request.id, new_request.sku,
+                "step=%d delivery: bin_id=%d sku=%s delivered - "
+                "replaced in queue with bin_id=%d sku=%d (pending=%d active=%d)",
+                self._cur_steps, bin_.id, bin_.sku,
+                new_bin.id, new_bin.sku,
                 self.order_sequencer.pending_count, self.order_sequencer.active_count,
             )
+            self.request_queue[self.request_queue.index(bin_)] = new_bin
         else:
-            new_request = None
             logger.info(
-                "step=%d delivery: shelf_id=%d sku=%s delivered - "
-                "no active orders available, queue shrinks to %d "
-                "(pending=%d active=%d)",
-                self._cur_steps, shelf.id, shelf.sku,
-                len(self.request_queue) - 1,
+                "step=%d delivery: bin_id=%d sku=%s delivered - "
+                "no matching active order (pending=%d active=%d)",
+                self._cur_steps, bin_.id, bin_.sku,
                 self.order_sequencer.pending_count, self.order_sequencer.active_count,
             )
-
-        if new_request is not None:
-            self.request_queue[self.request_queue.index(shelf)] = new_request
-        else:
-            self.request_queue.remove(shelf)
+            self.request_queue.remove(bin_)
         self._step_deliveries += 1
         return rewards
 
-    def _deposit_to_shelf_cell(self, agent: Agent, sx: int, sy: int,
-                               rewards: np.ndarray[int]) -> np.ndarray[int]:
-        """Place the shelf carried by *agent* into rack slot (sx, sy) and
-        clear the CARRIED_SHELVES layer at the agent's current cell."""
-        shelf = agent.carrying_shelf
-        if shelf.depleted:
-            shelf.on_grid = False
-            self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-            agent.carrying_shelf = None
+    def _storage_bin_candidates(self) -> List["LogicalBin"]:
+        """Bins resting in storage shelves that are not already queued or carried."""
+        carried_ids = {a.carrying_bin.id for a in self.agents if a.carrying_bin}
+        queued_ids = {b.id for b in self.request_queue if b is not None}
+        candidates: List[LogicalBin] = []
+        for shelf in self.storage_shelves:
+            for bin_ in shelf.bin_slots:
+                if bin_ is None:
+                    continue
+                if bin_.id in carried_ids or bin_.id in queued_ids:
+                    continue
+                candidates.append(bin_)
+        candidates.sort(key=lambda b: b.id)
+        return candidates
+
+    def _deposit_to_storage(self, agent: Agent, shelf: "Shelf", slot_idx: int,
+                            rewards: np.ndarray[int]) -> np.ndarray[int]:
+        """Place the bin carried by *agent* into a storage shelf slot."""
+        bin_ = agent.carrying_bin
+        if shelf.bin_slots[slot_idx] is not None:
             agent.busy = False
-            agent.has_delivered = False
-            logger.info(
-                "step=%d: depleted shelf_id=%d sku=%d removed from warehouse",
-                self._cur_steps, shelf.id, shelf.sku,
-            )
-        else:
-            self.grid[CollisionLayers.SHELVES, sy, sx] = shelf.id
-            self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-            shelf.x, shelf.y = sx, sy
-            agent.carrying_shelf = None
-            agent.busy = False
-            agent.has_delivered = False
-            if self.reward_type == RewardType.GLOBAL:
-                rewards += 0.5
-            elif self.reward_type == RewardType.INDIVIDUAL:
-                rewards[agent.id - 1] += 0.1
+            return rewards
+        shelf.place_bin(bin_, slot_idx)
+        self._release_reserved_slot_for_bin(bin_)
+        self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
+        agent.carrying_bin = None
+        agent.busy = False
+        agent.has_delivered = False
+        if self.reward_type == RewardType.GLOBAL:
+            rewards += 0.5
+        elif self.reward_type == RewardType.INDIVIDUAL:
+            rewards[agent.id - 1] += 0.1
         return rewards
 
     def _return_depleted_to_replenishment(
         self,
         agent: Agent,
+        shelf: "Shelf",
+        slot_idx: int,
         rewards: np.ndarray[int],
     ) -> np.ndarray[int]:
-        """Drop an exhausted wrapper at replenishment and remove it from active circulation."""
-        shelf = agent.carrying_shelf
+        """Drop a depleted bin into a replenishment slot; it will be refilled in-place."""
+        bin_ = agent.carrying_bin
+        if shelf.bin_slots[slot_idx] is not None:
+            agent.busy = False
+            return rewards
+        self._remove_bin_from_sku_lookup(bin_)
+        original_sku = bin_.sku
+        if original_sku is not None:
+            self._assign_sku_to_bin(bin_, original_sku)
+        shelf.place_bin(bin_, slot_idx)
+        self._release_reserved_slot_for_bin(bin_)
+        bin_.from_replenishment = True
         self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-        self._release_reserved_slot_for_shelf(shelf)
-        self._remove_shelf_from_sku_lookup(shelf)
-        shelf.x, shelf.y = agent.x, agent.y
-        shelf.on_grid = False
-        shelf.from_replenishment = False
-        agent.carrying_shelf = None
+        agent.carrying_bin = None
         agent.busy = False
         agent.has_delivered = False
         logger.info(
-            "step=%d: depleted shelf_id=%d bin_id=%s returned to replenishment at (%d,%d)",
-            self._cur_steps, shelf.id, shelf.bin_id, agent.x, agent.y,
+            "step=%d: depleted bin_id=%d sku=%s refilled at replenishment shelf_id=%d slot=%d",
+            self._cur_steps, bin_.id, bin_.sku, shelf.id, slot_idx,
         )
         return rewards
 
     def _execute_unload(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        # Side drop-off to pickerwall: AGV is at a highway entry cell adjacent to a goal.
-        goal_xy = self._agv_entry_to_goal.get((agent.x, agent.y))
-        if goal_xy is not None:
-            gx, gy = goal_xy
-            if self.grid[CollisionLayers.SHELVES, gy, gx] != 0:
-                # Goal slot still occupied; can't deposit yet
-                agent.busy = False
-                return rewards
-            return self._deliver_to_pickerwall(agent, gx, gy, rewards)
-
-        # Side deposit to rack: AGV is on a highway cell adjacent to its target shelf slot.
-        target_rc = self.action_id_to_coords_map.get(agent.target)
-        if target_rc is not None:
-            tx, ty = target_rc[1], target_rc[0]   # (col, row) of the rack slot
-            if (abs(tx - agent.x) + abs(ty - agent.y) == 1
-                    and not self._is_highway(tx, ty)
-                    and (tx, ty) not in self.goals):
-                if self.grid[CollisionLayers.SHELVES, ty, tx] != 0:
-                    # Rack slot occupied; can't deposit
-                    agent.busy = False
-                    return rewards
-                return self._deposit_to_shelf_cell(agent, tx, ty, rewards)
-
-        # Legacy / fallback: agent is at the target cell itself.
-
-        # Can't deposit if another shelf is already sitting at this cell
-        if self.grid[CollisionLayers.SHELVES, agent.y, agent.x] != 0:
+        """Drop the carried bin into the slot given by agent.target."""
+        slot = self.action_id_to_slot.get(agent.target)
+        if slot is None:
+            agent.busy = False
+            return rewards
+        shelf_id, slot_idx = slot
+        shelf = self.shelves_by_id.get(shelf_id)
+        if shelf is None:
             agent.busy = False
             return rewards
 
-        if (agent.x, agent.y) in self._replenishment_locs_set:
-            if agent.carrying_shelf and agent.carrying_shelf.depleted:
-                return self._return_depleted_to_replenishment(agent, rewards)
-            # Replenishment zone only accepts exhausted wrappers returning for refill.
-            agent.busy = False
-            return rewards
-
-        if (agent.x, agent.y) in self.goals:
-            return self._deliver_to_pickerwall(agent, agent.x, agent.y, rewards)
-
-        if not self._is_highway(agent.x, agent.y):
-            return self._deposit_to_shelf_cell(agent, agent.x, agent.y, rewards)
-
-        return rewards
+        if shelf.cell_type == BinCellType.PICKERWALL:
+            return self._deliver_to_pickerwall(agent, shelf, slot_idx, rewards)
+        if shelf.cell_type == BinCellType.REPLENISHMENT:
+            return self._return_depleted_to_replenishment(agent, shelf, slot_idx, rewards)
+        return self._deposit_to_storage(agent, shelf, slot_idx, rewards)
 
     def execute_micro_actions(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
         for agent in self.agents:
@@ -1332,7 +1284,7 @@ class Warehouse(gym.Env):
             elif agent.req_action in [Action.LEFT, Action.RIGHT]:
                 self._execute_rotation(agent)
             elif agent.req_action == Action.TOGGLE_LOAD:
-                if not agent.carrying_shelf:
+                if not agent.carrying_bin:
                     rewards = self._execute_load(agent, rewards)
                 else:
                     rewards = self._execute_unload(agent, rewards)
@@ -1424,61 +1376,15 @@ class Warehouse(gym.Env):
 
         return specs
 
-    def _initialize_bin_backed_shelf_inventory(self) -> None:
-        """Pair each shelf 1:1 with a unique SKU and stock one bin per shelf.
-
-        Shelves are already placed at a random subset of shelf_locs equal in
-        count to the number of unique SKUs. Here we assign one SKU to each
-        shelf (and to one logical bin in the shelf's cell) so every shelf on
-        the grid has real stock. Storage cells without a shelf are left empty.
-        """
-        if self.order_sequencer is None:
-            return
-
-        unique_skus = self.order_sequencer.get_unique_skus()
-        self.order_sequencer._sku_to_shelves = {}
-        self.order_sequencer._sku_to_bins = {}
-
-        for shelf, sku in zip(self.shelfs, unique_skus):
-            cell = self.bin_cells_by_xy.get((shelf.x, shelf.y))
-            stocked_bin = cell.bins[0] if (cell is not None and cell.bins) else None
-
-            if stocked_bin is None:
-                shelf.sku = None
-                shelf.capacity = 0
-                shelf.initial_capacity = 0
-                shelf.bin_id = None
-                continue
-
-            quantity = self._assign_sku_to_bin(stocked_bin, sku)
-            shelf.sku = sku
-            shelf.capacity = quantity
-            shelf.initial_capacity = quantity
-            shelf.bin_id = stocked_bin.id
-            self.order_sequencer._sku_to_shelves.setdefault(sku, []).append(shelf)
-
-        logger.info(
-            "Shelf-SKU pairing initialised: shelves=%d unique_skus=%d skus_with_shelf=%d empty_shelf_locs=%d",
-            len(self.shelfs),
-            len(unique_skus),
-            len(self.order_sequencer._sku_to_shelves),
-            len(self.shelf_locs) - len(self.shelfs),
-        )
-
     def _bin_quantity_for_sku(self, sku: int) -> int:
         """Return how many units of a SKU fit in one usable bin."""
         if self.order_sequencer is None:
-            return Shelf.DEFAULT_CAPACITY
+            return 0
         unit_cube = self.order_sequencer.get_sku_unit_cube(sku)
         if unit_cube <= 0:
             return 0
         usable_volume = self.bin_volume_ft3 * self.bin_usable_fraction
         return max(0, int(math.floor(usable_volume / unit_cube)))
-
-    def _logical_bin_for_shelf(self, shelf: "Shelf") -> Optional[LogicalBin]:
-        if shelf.bin_id is None:
-            return None
-        return self.logical_bins_by_id.get(shelf.bin_id)
 
     def _assign_sku_to_bin(self, bin_: LogicalBin, sku: int) -> int:
         quantity = self._bin_quantity_for_sku(sku)
@@ -1486,6 +1392,8 @@ class Warehouse(gym.Env):
         bin_.sku = sku
         bin_.quantity = quantity
         bin_.used_volume_ft3 = quantity * unit_cube
+        bin_.depleted = False
+        bin_.fulfilled = False
         if self.order_sequencer is not None and quantity > 0:
             bins_for_sku = self.order_sequencer._sku_to_bins.setdefault(sku, [])
             if bin_ not in bins_for_sku:
@@ -1504,104 +1412,112 @@ class Warehouse(gym.Env):
             if candidate.id != bin_.id
         ]
 
-    def _remove_shelf_from_sku_lookup(self, shelf: "Shelf") -> None:
-        if self.order_sequencer is None or shelf.sku is None:
+    def _make_new_bin(self, cell_type: BinCellType, x: int, y: int) -> LogicalBin:
+        """Build a fresh LogicalBin with a unique id."""
+        self._next_bin_id += 1
+        return LogicalBin(
+            id=self._next_bin_id,
+            x=x,
+            y=y,
+            cell_type=cell_type,
+            volume_ft3=self.bin_volume_ft3,
+            usable_fraction=self.bin_usable_fraction,
+        )
+
+    def _initialize_bin_inventory(self) -> None:
+        """Populate storage shelves with one bin per unique SKU.
+
+        Bins are spread randomly across storage shelves and their empty slots.
+        Any leftover storage capacity is left empty (not all slots are filled).
+        """
+        if self.order_sequencer is None:
             return
-        shelves_for_sku = self.order_sequencer._sku_to_shelves.get(shelf.sku)
-        if not shelves_for_sku:
-            return
-        self.order_sequencer._sku_to_shelves[shelf.sku] = [
-            candidate
-            for candidate in shelves_for_sku
-            if candidate.id != shelf.id
+
+        unique_skus = self.order_sequencer.get_unique_skus()
+        self.order_sequencer._sku_to_bins = {}
+        self._bins_by_id: Dict[int, LogicalBin] = {}
+
+        storage_slots: List[Tuple[Shelf, int]] = [
+            (shelf, slot_idx)
+            for shelf in self.storage_shelves
+            for slot_idx in range(shelf.num_slots)
         ]
+        if not storage_slots:
+            return
 
-    def _reserve_cell_slot_for_shelf(
+        n_bins = min(len(unique_skus), len(storage_slots))
+        slot_indices = np.random.choice(len(storage_slots), size=n_bins, replace=False)
+
+        for sku, idx in zip(unique_skus[:n_bins], slot_indices):
+            shelf, slot_idx = storage_slots[int(idx)]
+            bin_ = self._make_new_bin(BinCellType.STORAGE, shelf.x, shelf.y)
+            self._assign_sku_to_bin(bin_, sku)
+            shelf.place_bin(bin_, slot_idx)
+            self._bins_by_id[bin_.id] = bin_
+
+        logger.info(
+            "Bin inventory initialised: bins=%d unique_skus=%d storage_slots=%d slots_used=%d",
+            len(self._bins_by_id), len(unique_skus),
+            len(storage_slots), n_bins,
+        )
+
+    def _reserve_slot_for_bin(
         self,
-        shelf: "Shelf",
-        x: int,
-        y: int,
-        cell_type: BinCellType,
-    ) -> bool:
-        """Reserve one logical slot inside a pickerwall/replenishment cell."""
-        cell = self.bin_cells_by_xy.get((x, y))
-        if cell is None or cell.cell_type != cell_type:
-            return False
-        if shelf.bin_id is None:
-            return False
+        bin_: LogicalBin,
+        shelf: Shelf,
+    ) -> Optional[int]:
+        """Reserve the first empty slot on ``shelf`` for ``bin_``.
 
-        for slot in cell.bins:
-            if slot.id not in self._slot_occupancy_by_slot_id:
-                self._slot_occupancy_by_slot_id[slot.id] = shelf.bin_id
-                if cell_type == BinCellType.PICKERWALL:
-                    self._pickerwall_slot_by_shelf_id[shelf.id] = slot.id
-                elif cell_type == BinCellType.REPLENISHMENT:
-                    self._replenishment_slot_by_shelf_id[shelf.id] = slot.id
-                return True
-        return False
+        Returns the slot_index on success, None if the shelf is full.
+        Reservations prevent two AGVs from targeting the same destination slot
+        before either one actually arrives and deposits.
+        """
+        for slot_idx in range(shelf.num_slots):
+            key = (shelf.id, slot_idx)
+            if shelf.bin_slots[slot_idx] is None and key not in self._reserved_slots:
+                self._reserved_slots[key] = bin_.id
+                return slot_idx
+        return None
 
-    def _release_reserved_slot_for_shelf(self, shelf: "Shelf") -> None:
-        slot_id = self._pickerwall_slot_by_shelf_id.pop(shelf.id, None)
-        if slot_id is None:
-            slot_id = self._replenishment_slot_by_shelf_id.pop(shelf.id, None)
-        if slot_id is not None:
-            self._slot_occupancy_by_slot_id.pop(slot_id, None)
+    def _release_reserved_slot_for_bin(self, bin_: LogicalBin) -> None:
+        keys = [k for k, v in self._reserved_slots.items() if v == bin_.id]
+        for k in keys:
+            del self._reserved_slots[k]
 
-    def _decrement_shelf_bin_inventory(self, shelf: "Shelf", quantity: int) -> int:
-        """Pick units from the logical bin backing a movable Shelf wrapper."""
-        bin_ = self._logical_bin_for_shelf(shelf)
-        if bin_ is None:
-            shelf.capacity = max(0, shelf.capacity - quantity)
-            if shelf.capacity <= 0:
-                self._remove_shelf_from_sku_lookup(shelf)
-            return shelf.capacity
-
+    def _decrement_bin_inventory(self, bin_: LogicalBin, quantity: int) -> int:
+        """Pick ``quantity`` units from ``bin_``; return remaining stock."""
         bin_.quantity = max(0, bin_.quantity - quantity)
         unit_cube = self.order_sequencer.get_sku_unit_cube(bin_.sku) if (
             self.order_sequencer is not None and bin_.sku is not None
         ) else 0.0
         bin_.used_volume_ft3 = bin_.quantity * unit_cube
-        shelf.capacity = bin_.quantity
         if bin_.quantity <= 0:
+            bin_.depleted = True
             self._remove_bin_from_sku_lookup(bin_)
-            self._remove_shelf_from_sku_lookup(shelf)
-        return shelf.capacity
+        return bin_.quantity
 
     def reset(self, seed=None, options=None)-> Tuple:
-        Shelf.counter = 0
         Agent.counter = 0
         self._cur_inactive_steps = 0
         self._cur_steps = 0
         self._step_deliveries = 0
         self.seed(seed)
-        self._shelf_to_order = {}
+        self._bin_to_order = {}
         self._packaging_slots = {}
         self._pickerwall_pending = deque()
-        self._pickerwall_slot_by_shelf_id = {}
-        self._replenishment_slot_by_shelf_id = {}
-        self._slot_occupancy_by_slot_id = {}
+        self._reserved_slots = {}
+        self._next_bin_id = 0
+        self._bins_by_id = {}
         self._picker_hf_profile_by_id = {}
         self._picker_hf_state_by_id = {}
         self._picker_hf_episode_delay_steps = 0
         self._picker_hf_episode_failed_pick_delays = 0
         self._latest_picker_diagnostics = []
 
-        # Create one shelf per unique SKU, scattered across random shelf_locs.
-        # Remaining shelf_locs are left truly empty (no Shelf object) so each
-        # SKU lives in exactly one bin rather than filling every rack slot.
-        shelf_locs_list = [tuple(loc) for loc in self.shelf_locs]
-        if self.order_sequencer is not None:
-            n_shelves = min(
-                len(self.order_sequencer.get_unique_skus()),
-                len(shelf_locs_list),
-            )
-            loc_indices = np.random.choice(
-                len(shelf_locs_list), size=n_shelves, replace=False
-            )
-            selected_locs = [shelf_locs_list[int(i)] for i in loc_indices]
-        else:
-            selected_locs = shelf_locs_list
-        self.shelfs = [Shelf(x, y) for (y, x) in selected_locs]
+        # Clear all static shelves' slots so re-runs start empty.
+        for shelf in self.shelfs:
+            for slot_idx in range(shelf.num_slots):
+                shelf.bin_slots[slot_idx] = None
 
         agent_loc_ids = np.random.choice(len(self.agv_spawn_locs), size=self.num_agents, replace=False)
         agent_locs = [self.agv_spawn_locs[agent_loc_ids, 0], self.agv_spawn_locs[agent_loc_ids, 1]]
@@ -1651,31 +1567,33 @@ class Warehouse(gym.Env):
                 "reset: order_sequencer present - using time-gated SKU-based request queue"
             )
             self.order_sequencer.reset()
-            self._initialize_bin_backed_shelf_inventory()
+            self._initialize_bin_inventory()
             released = self.order_sequencer.release_pending_orders(0)
             logger.info("reset: released %d orders at t=0 (queue capacity=%d)", len(released), self.request_queue_size)
             self.request_queue = []
             for _ in range(self.request_queue_size):
-                carried = {a.carrying_shelf for a in self.agents if a.carrying_shelf}
-                candidates = list(set(self.shelfs) - set(self.request_queue) - carried)
-                result = self.order_sequencer.next_order_shelf(candidates)
-                if result is not None:
-                    shelf, order = result
-                    self._shelf_to_order[shelf.id] = order
-                    self.request_queue.append(shelf)
+                candidates = self._storage_bin_candidates()
+                result = self.order_sequencer.next_order_bin(candidates)
+                if result is None:
+                    break
+                bin_, order = result
+                self._bin_to_order[bin_.id] = order
+                self.request_queue.append(bin_)
             logger.info(
                 "reset: initial request_queue filled=%d/%d skus=%s",
                 len(self.request_queue), self.request_queue_size,
-                [s.sku for s in self.request_queue],
+                [b.sku for b in self.request_queue],
             )
         else:
             logger.info(
-                "reset: no order_sequencer - filling request queue with %d random shelves",
+                "reset: no order_sequencer - filling request queue with %d random bins",
                 self.request_queue_size,
             )
+            storage_bins = [b for b in self._bins_by_id.values() if b.on_shelf]
+            size = min(self.request_queue_size, len(storage_bins))
             self.request_queue = list(
-                np.random.choice(self.shelfs, size=self.request_queue_size, replace=False)
-            )
+                np.random.choice(storage_bins, size=size, replace=False)
+            ) if size > 0 else []
 
         self.observation_space_mapper.extract_environment_info(self)
         return tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
@@ -1684,109 +1602,36 @@ class Warehouse(gym.Env):
         """Fill the request queue from active orders up to request_queue_size."""
         if self.order_sequencer is None:
             return
-        carried = {a.carrying_shelf for a in self.agents if a.carrying_shelf}
-        pickerwall_shelf_ids = {
-            self.grid[CollisionLayers.SHELVES, yy, xx]
-            for (xx, yy) in self.goals
-            if self.grid[CollisionLayers.SHELVES, yy, xx] != 0
-        }
-        pickerwall_shelves = {self.shelfs[sid - 1] for sid in pickerwall_shelf_ids}
         while len(self.request_queue) < self.request_queue_size:
-            candidates = [
-                s for s in self.shelfs
-                if s.on_grid
-                and s not in self.request_queue
-                and s not in carried
-                and s not in pickerwall_shelves
-            ]
-            result = self.order_sequencer.next_order_shelf(candidates)
+            candidates = self._storage_bin_candidates()
+            result = self.order_sequencer.next_order_bin(candidates)
             if result is None:
                 logger.debug(
-                    "step=%d _refill: active queue empty or no matching shelf - "
+                    "step=%d _refill: active queue empty or no matching bin - "
                     "queue stays at %d/%d",
                     self._cur_steps, len(self.request_queue), self.request_queue_size,
                 )
                 break
-            shelf, order = result
-            self._shelf_to_order[shelf.id] = order
+            bin_, order = result
+            self._bin_to_order[bin_.id] = order
             logger.info(
-                "step=%d _refill: added shelf_id=%d sku=%d to request_queue "
+                "step=%d _refill: added bin_id=%d sku=%d to request_queue "
                 "(queue=%d/%d pending=%d active=%d)",
-                self._cur_steps, shelf.id, shelf.sku,
+                self._cur_steps, bin_.id, bin_.sku,
                 len(self.request_queue) + 1, self.request_queue_size,
                 self.order_sequencer.pending_count, self.order_sequencer.active_count,
             )
-            self.request_queue.append(shelf)
+            self.request_queue.append(bin_)
 
-    def _issue_replenishment(self, sku: int) -> Optional["Shelf"]:
-        """Spawn a fresh shelf with the given SKU at a free replenishment slot. Returns None if no slot is free."""
-        if not self.replenishment_locs:
-            return None
+    def _resolve_pickerwall_bin_for_sku(self, sku: int) -> int:
+        """Return the bin_id of a bin resting in a pickerwall shelf with the given SKU.
 
-        free_slot = None
-        for (rx, ry) in self.replenishment_locs:
-            if (self.grid[CollisionLayers.SHELVES, ry, rx] == 0
-                    and self.grid[CollisionLayers.CARRIED_SHELVES, ry, rx] == 0):
-                free_slot = (rx, ry)
-                break
-
-        if free_slot is None:
-            logger.warning(
-                "step=%d _issue_replenishment: sku=%d - no free replenishment slot available",
-                self._cur_steps, sku,
-            )
-            return None
-
-        rx, ry = free_slot
-        new_shelf = Shelf(rx, ry)
-        new_shelf.sku = sku
-        new_shelf.from_replenishment = True
-        replenishment_bin = next(
-            (
-                bin_
-                for bin_ in self.replenishment_logical_bins
-                if (bin_.x, bin_.y) == (rx, ry)
-                and (bin_.sku is None or bin_.quantity <= 0)
-            ),
-            None,
-        )
-        if replenishment_bin is not None:
-            replenishment_quantity = self._assign_sku_to_bin(replenishment_bin, sku)
-            new_shelf.bin_id = replenishment_bin.id
-        else:
-            replenishment_quantity = self._bin_quantity_for_sku(sku)
-        new_shelf.capacity = replenishment_quantity
-        new_shelf.initial_capacity = replenishment_quantity
-        if new_shelf.bin_id is not None:
-            self._reserve_cell_slot_for_shelf(
-                new_shelf,
-                rx,
-                ry,
-                BinCellType.REPLENISHMENT,
-            )
-        self.shelfs.append(new_shelf)
-        self.grid[CollisionLayers.SHELVES, ry, rx] = new_shelf.id
-        if self.order_sequencer is not None:
-            self.order_sequencer._sku_to_shelves.setdefault(sku, []).append(new_shelf)
-
-        logger.info(
-            "step=%d replenishment: new shelf_id=%d sku=%d spawned at (%d,%d) "
-            "(total_shelves=%d)",
-            self._cur_steps, new_shelf.id, sku, rx, ry, len(self.shelfs),
-        )
-
-        self._refill_request_queue()
-        return new_shelf
-
-    def _resolve_pickerwall_shelf_for_sku(self, sku: int) -> int:
-        """Return the shelf_id of a shelf sitting at the pickerwall with the given SKU.
-
-        Returns -1 if no matching shelf is currently at a pickerwall slot.
+        Returns -1 if no matching bin is currently on pickerwall.
         """
-        for (x, y) in self.goals:
-            shelf_id = self.grid[CollisionLayers.SHELVES, y, x]
-            if shelf_id != 0 and self.shelfs[shelf_id - 1].sku == sku:
-                return shelf_id
+        for shelf in self.pickerwall_shelves:
+            for bin_ in shelf.bin_slots:
+                if bin_ is not None and bin_.sku == sku:
+                    return bin_.id
         return -1
 
     def _nearest_pickerwall_zone(self, row: int) -> Optional[int]:
@@ -1799,9 +1644,12 @@ class Warehouse(gym.Env):
             ),
         )
 
-    def _shelf_pickerwall_zone(self, shelf_id: int) -> Optional[int]:
-        shelf = self.shelfs[shelf_id - 1]
-        if (shelf.x, shelf.y) not in self.goals:
+    def _bin_pickerwall_zone(self, bin_id: int) -> Optional[int]:
+        bin_ = self._bins_by_id.get(bin_id)
+        if bin_ is None or bin_.shelf_id is None:
+            return None
+        shelf = self.shelves_by_id.get(bin_.shelf_id)
+        if shelf is None or shelf.cell_type != BinCellType.PICKERWALL:
             return None
         return self._goal_to_zone.get((shelf.x, shelf.y))
 
@@ -1831,21 +1679,27 @@ class Warehouse(gym.Env):
         selected = None
 
         while self._pickerwall_pending:
-            shelf_id, sku_entry, order = self._pickerwall_pending.popleft()
-            shelf = self.shelfs[shelf_id - 1]
+            bin_id, sku_entry, order = self._pickerwall_pending.popleft()
+            bin_ = self._bins_by_id.get(bin_id)
 
-            if (shelf.x, shelf.y) not in self.goals or \
-                    self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] != shelf_id:
+            if bin_ is None or bin_.shelf_id is None:
                 logger.debug(
-                    "step=%d _claim: skipping stale pickerwall_pending shelf_id=%d",
-                    self._cur_steps, shelf_id,
+                    "step=%d _claim: skipping stale pickerwall_pending bin_id=%d",
+                    self._cur_steps, bin_id,
+                )
+                continue
+            shelf = self.shelves_by_id.get(bin_.shelf_id)
+            if shelf is None or shelf.cell_type != BinCellType.PICKERWALL:
+                logger.debug(
+                    "step=%d _claim: bin_id=%d no longer on pickerwall",
+                    self._cur_steps, bin_id,
                 )
                 continue
 
-            if zone_id is None or self._shelf_pickerwall_zone(shelf_id) == zone_id:
-                selected = (shelf_id, sku_entry, order)
+            if zone_id is None or self._bin_pickerwall_zone(bin_id) == zone_id:
+                selected = (bin_id, sku_entry, order)
                 break
-            skipped.append((shelf_id, sku_entry, order))
+            skipped.append((bin_id, sku_entry, order))
 
         while skipped:
             self._pickerwall_pending.appendleft(skipped.pop())
@@ -1857,10 +1711,10 @@ class Warehouse(gym.Env):
         entry: Tuple[int, SKUEntry, Order],
         remaining_cap: int,
     ) -> int:
-        shelf_id, sku_entry, order = entry
+        bin_id, sku_entry, order = entry
         if sku_entry.quantity <= remaining_cap:
             claims.append(PickerClaim(
-                shelf_id=shelf_id,
+                bin_id=bin_id,
                 sku_entry=sku_entry,
                 order_number=order.order_number,
                 order=order,
@@ -1878,12 +1732,12 @@ class Warehouse(gym.Env):
             unit_cube=sku_entry.unit_cube,
         )
         claims.append(PickerClaim(
-            shelf_id=shelf_id,
+            bin_id=bin_id,
             sku_entry=claim_entry,
             order_number=order.order_number,
             order=order,
         ))
-        self._pickerwall_pending.appendleft((shelf_id, remaining_entry, order))
+        self._pickerwall_pending.appendleft((bin_id, remaining_entry, order))
         return 0
 
     def _claim_items_for_picker(self, picker: "Picker") -> List["PickerClaim"]:
@@ -1921,43 +1775,43 @@ class Warehouse(gym.Env):
         return claims
 
     def _build_picker_task(self, picker: "Picker", claims: List["PickerClaim"]) -> "PickerTask":
-        """Preserve policy claim order while grouping same-shelf work."""
-        shelf_groups: Dict[int, List[PickerClaim]] = {}
-        shelf_order: List[int] = []
+        """Preserve policy claim order while grouping same-bin work."""
+        bin_groups: Dict[int, List[PickerClaim]] = {}
+        bin_order: List[int] = []
         unresolved: List[PickerClaim] = []
         for claim in claims:
-            if claim.shelf_id == -1:
+            if claim.bin_id == -1:
                 unresolved.append(claim)
                 continue
-            if claim.shelf_id not in shelf_groups:
-                shelf_groups[claim.shelf_id] = []
-                shelf_order.append(claim.shelf_id)
-            shelf_groups[claim.shelf_id].append(claim)
+            if claim.bin_id not in bin_groups:
+                bin_groups[claim.bin_id] = []
+                bin_order.append(claim.bin_id)
+            bin_groups[claim.bin_id].append(claim)
 
         ordered_claims: List[PickerClaim] = []
-        for shelf_id in shelf_order:
-            ordered_claims.extend(shelf_groups[shelf_id])
+        for bin_id in bin_order:
+            ordered_claims.extend(bin_groups[bin_id])
         ordered_claims.extend(unresolved)
         return PickerTask(claims=ordered_claims)
 
-    def _maybe_mark_shelf_fulfilled(self, shelf: "Shelf") -> None:
-        """Mark shelf.fulfilled = True if no pending or in-flight picks remain for it."""
-        sid = shelf.id
-        for entry_shelf_id, _sku_entry, _order in self._pickerwall_pending:
-            if entry_shelf_id == sid:
-                shelf.fulfilled = False
+    def _maybe_mark_bin_fulfilled(self, bin_: "LogicalBin") -> None:
+        """Mark bin.fulfilled = True if no pending or in-flight picks remain for it."""
+        bid = bin_.id
+        for entry_bin_id, _sku_entry, _order in self._pickerwall_pending:
+            if entry_bin_id == bid:
+                bin_.fulfilled = False
                 return
         for picker in self.pickers:
             if picker.task is None:
                 continue
             for claim in picker.task.claims:
-                if not claim.picked and claim.shelf_id == sid:
-                    shelf.fulfilled = False
+                if not claim.picked and claim.bin_id == bid:
+                    bin_.fulfilled = False
                     return
-        shelf.fulfilled = True
+        bin_.fulfilled = True
         logger.info(
-            "step=%d: shelf_id=%d sku=%d marked fulfilled - eligible for displacement",
-            self._cur_steps, shelf.id, shelf.sku,
+            "step=%d: bin_id=%d sku=%s marked fulfilled - eligible for displacement",
+            self._cur_steps, bin_.id, bin_.sku,
         )
 
     def _packaging_locations_for_picker(self, picker: "Picker") -> List[Tuple[int, int]]:
@@ -2021,7 +1875,7 @@ class Warehouse(gym.Env):
                 slot["station"] = closest_pkg
         pkg_target = (closest_pkg[1], closest_pkg[0])  # (row, col) for find_picker_path
         picker.path = self.find_picker_path(
-            (picker.y, picker.x), pkg_target, picker, care_for_agents=True
+            (picker.y, picker.x), pkg_target, care_for_agents=True
         )
         picker.state = PickerState.WALKING_TO_PACKAGING
         orders = list({c.order_number for c in picker.task.claims})
@@ -2034,10 +1888,9 @@ class Warehouse(gym.Env):
         )
 
     def _picker_walk_to_next_shelf(self, picker: "Picker") -> None:
-        """Route the picker to the next unpicked shelf, or to packaging if all claims are done."""
+        """Route the picker to the pickerwall shelf holding the next bin, or to packaging."""
         task = picker.task
 
-        # Skip claims that have already been picked
         while (task.current_claim_index < len(task.claims)
                and task.claims[task.current_claim_index].picked):
             task.current_claim_index += 1
@@ -2048,73 +1901,52 @@ class Warehouse(gym.Env):
 
         claim = task.claims[task.current_claim_index]
 
-        # Resolve shelf_id=-1 (shelf wasn't at pickerwall when claim was made)
-        if claim.shelf_id == -1:
-            resolved_id = self._resolve_pickerwall_shelf_for_sku(claim.sku_entry.sku)
+        def _bin_on_pickerwall(bid: int) -> bool:
+            b = self._bins_by_id.get(bid)
+            if b is None or b.shelf_id is None:
+                return False
+            s = self.shelves_by_id.get(b.shelf_id)
+            return s is not None and s.cell_type == BinCellType.PICKERWALL
+
+        if claim.bin_id == -1 or not _bin_on_pickerwall(claim.bin_id):
+            resolved_id = self._resolve_pickerwall_bin_for_sku(claim.sku_entry.sku)
             if resolved_id == -1:
-                picker.state = PickerState.WAITING_FOR_SHELF
-                return
-            # Propagate resolved shelf_id to all unpicked claims for this SKU
-            for c in task.claims:
-                if not c.picked and c.sku_entry.sku == claim.sku_entry.sku:
-                    c.shelf_id = resolved_id
-            claim.shelf_id = resolved_id
-
-        shelf = self.shelfs[claim.shelf_id - 1]
-        goal_xy = (shelf.x, shelf.y)
-
-        # Verify the shelf is still sitting at a pickerwall slot
-        if goal_xy not in self.goals or self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] != claim.shelf_id:
-            # Shelf claims are SKU-based from order logic. If the originally
-            # claimed shelf moved, try re-binding to any matching SKU currently
-            # available at pickerwall before entering a waiting state.
-            resolved_id = self._resolve_pickerwall_shelf_for_sku(claim.sku_entry.sku)
-            if resolved_id != -1:
-                for c in task.claims:
-                    if not c.picked and c.sku_entry.sku == claim.sku_entry.sku:
-                        c.shelf_id = resolved_id
-                claim.shelf_id = resolved_id
-                shelf = self.shelfs[claim.shelf_id - 1]
-                goal_xy = (shelf.x, shelf.y)
-            else:
                 logger.info(
-                    "step=%d picker_id=%d: shelf_id=%d (sku=%d) not at pickerwall - WAITING_FOR_SHELF",
-                    self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku,
+                    "step=%d picker_id=%d: no pickerwall bin for sku=%d - WAITING_FOR_SHELF",
+                    self._cur_steps, picker.id, claim.sku_entry.sku,
                 )
                 picker.state = PickerState.WAITING_FOR_SHELF
                 return
+            for c in task.claims:
+                if not c.picked and c.sku_entry.sku == claim.sku_entry.sku:
+                    c.bin_id = resolved_id
+            claim.bin_id = resolved_id
 
-        # Re-verify after potential SKU re-bind.
-        if goal_xy not in self.goals or self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] != claim.shelf_id:
-            logger.info(
-                "step=%d picker_id=%d: shelf_id=%d (sku=%d) not at pickerwall - WAITING_FOR_SHELF",
-                self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku,
-            )
-            picker.state = PickerState.WAITING_FOR_SHELF
-            return
+        bin_ = self._bins_by_id[claim.bin_id]
+        shelf = self.shelves_by_id[bin_.shelf_id]
+        goal_xy = (shelf.x, shelf.y)
 
         entries = self._goal_to_picker_entry.get(goal_xy, [])
         if not entries:
             logger.warning(
-                "step=%d picker_id=%d: no picker entry adjacent to goal %s for shelf_id=%d - skipping",
-                self._cur_steps, picker.id, goal_xy, claim.shelf_id,
+                "step=%d picker_id=%d: no picker entry adjacent to goal %s for bin_id=%d - skipping",
+                self._cur_steps, picker.id, goal_xy, claim.bin_id,
             )
-            # Force-skip all claims for this shelf
             for c in task.claims:
-                if c.shelf_id == claim.shelf_id and not c.picked:
+                if c.bin_id == claim.bin_id and not c.picked:
                     c.picked = True
             self._picker_walk_to_next_shelf(picker)
             return
 
         entry_xy = min(entries, key=lambda e: abs(e[0] - picker.x) + abs(e[1] - picker.y))
-        target = (entry_xy[1], entry_xy[0])  # (row, col) for find_picker_path
+        target = (entry_xy[1], entry_xy[0])
         picker.path = self.find_picker_path(
-            (picker.y, picker.x), target, picker, care_for_agents=True
+            (picker.y, picker.x), target, care_for_agents=True
         )
         picker.state = PickerState.WALKING_TO_SHELF
         logger.info(
-            "step=%d picker_id=%d: ->WALKING_TO_SHELF shelf_id=%d sku=%d entry=%s path_len=%d",
-            self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku,
+            "step=%d picker_id=%d: ->WALKING_TO_SHELF bin_id=%d sku=%d entry=%s path_len=%d",
+            self._cur_steps, picker.id, claim.bin_id, claim.sku_entry.sku,
             entry_xy, len(picker.path),
         )
 
@@ -2196,11 +2028,11 @@ class Warehouse(gym.Env):
             hf_state, hf_profile = self._picker_hf_context(picker)
 
             current_claim = None
-            current_shelf_id = -1
+            current_bin_id = -1
             current_order_number = ""
             if picker.task is not None and picker.task.current_claim_index < len(picker.task.claims):
                 current_claim = picker.task.claims[picker.task.current_claim_index]
-                current_shelf_id = int(current_claim.shelf_id)
+                current_bin_id = int(current_claim.bin_id)
                 current_order_number = str(current_claim.order_number)
 
             reason_code = "unknown"
@@ -2273,7 +2105,7 @@ class Warehouse(gym.Env):
                 "stalled": bool(picker.stalled),
                 "speed_limited": bool(picker.speed_limited_this_step),
                 "blocked_by": blocked_by,
-                "current_shelf_id": int(current_shelf_id),
+                "current_bin_id": int(current_bin_id),
                 "current_order": current_order_number,
                 "pending_pickerwall_claims": int(len(self._pickerwall_pending)),
                 "reason_code": reason_code,
@@ -2368,11 +2200,11 @@ class Warehouse(gym.Env):
         if not self.use_sku_size_pick_time or not picker.task:
             return max(1, self.simulated_seconds_to_steps(base_seconds))
 
-        current_shelf_id = picker.task.claims[picker.task.current_claim_index].shelf_id
+        current_bin_id = picker.task.claims[picker.task.current_claim_index].bin_id
         unit_cube = 0.0
         quantity = 0
         for claim in picker.task.claims:
-            if claim.picked or claim.shelf_id != current_shelf_id:
+            if claim.picked or claim.bin_id != current_bin_id:
                 continue
             unit_cube = max(unit_cube, float(claim.sku_entry.unit_cube or 0.0))
             quantity += claim.sku_entry.quantity
@@ -2440,7 +2272,7 @@ class Warehouse(gym.Env):
                             if blocking_picker is None or blocking_picker.fixing_clash == 0:
                                 dest_col, dest_row = picker.path[-1]
                                 new_path = self.find_picker_path(
-                                    (picker.y, picker.x), (dest_row, dest_col), picker, care_for_agents=True
+                                    (picker.y, picker.x), (dest_row, dest_col), care_for_agents=True
                                 )
                                 if new_path:
                                     logger.debug(
@@ -2461,8 +2293,8 @@ class Warehouse(gym.Env):
                     picker.pick_ticks_remaining = self._pick_ticks_for_current_shelf(picker)
                     claim = picker.task.claims[picker.task.current_claim_index]
                     logger.info(
-                        "step=%d picker_id=%d: arrived -> PICKING shelf_id=%d sku=%d (pick_ticks=%d)",
-                        self._cur_steps, picker.id, claim.shelf_id, claim.sku_entry.sku,
+                        "step=%d picker_id=%d: arrived -> PICKING bin_id=%d sku=%d (pick_ticks=%d)",
+                        self._cur_steps, picker.id, claim.bin_id, claim.sku_entry.sku,
                         picker.pick_ticks_remaining,
                     )
 
@@ -2480,31 +2312,25 @@ class Warehouse(gym.Env):
                             picker.pick_ticks_remaining,
                         )
                         continue
-                    current_shelf_id = picker.task.claims[picker.task.current_claim_index].shelf_id
-                    shelf = self.shelfs[current_shelf_id - 1]
-                    # Pick every unpicked claim for this shelf in a single visit
+                    current_bin_id = picker.task.claims[picker.task.current_claim_index].bin_id
+                    bin_ = self._bins_by_id.get(current_bin_id)
+                    # Pick every unpicked claim for this bin in a single visit
                     for claim in picker.task.claims:
-                        if not claim.picked and claim.shelf_id == current_shelf_id:
+                        if not claim.picked and claim.bin_id == current_bin_id:
                             claim.picked = True
-                            remaining_stock = self._decrement_shelf_bin_inventory(
-                                shelf,
-                                claim.sku_entry.quantity,
-                            )
-                            logger.info(
-                                "step=%d picker_id=%d: picked %d unit(s) from shelf_id=%d "
-                                "bin_id=%s sku=%d for order=%s (stock_remaining=%d)",
-                                self._cur_steps, picker.id, claim.sku_entry.quantity,
-                                shelf.id, shelf.bin_id, shelf.sku, claim.order_number,
-                                remaining_stock,
-                            )
-                    if shelf.capacity <= 0 and not shelf.depleted:
-                        shelf.depleted = True
-                        logger.info(
-                            "step=%d: shelf_id=%d sku=%d stock exhausted - issuing replenishment",
-                            self._cur_steps, shelf.id, shelf.sku,
-                        )
-                        self._issue_replenishment(shelf.sku)
-                    self._maybe_mark_shelf_fulfilled(shelf)
+                            if bin_ is not None:
+                                remaining_stock = self._decrement_bin_inventory(
+                                    bin_,
+                                    claim.sku_entry.quantity,
+                                )
+                                logger.info(
+                                    "step=%d picker_id=%d: picked %d unit(s) from bin_id=%d "
+                                    "sku=%s for order=%s (stock_remaining=%d)",
+                                    self._cur_steps, picker.id, claim.sku_entry.quantity,
+                                    bin_.id, bin_.sku, claim.order_number, remaining_stock,
+                                )
+                    if bin_ is not None:
+                        self._maybe_mark_bin_fulfilled(bin_)
                     self._picker_walk_to_next_shelf(picker)
 
             # WALKING_TO_PACKAGING
@@ -2525,7 +2351,7 @@ class Warehouse(gym.Env):
                             if blocking_picker is None or blocking_picker.fixing_clash == 0:
                                 dest_col, dest_row = picker.path[-1]
                                 new_path = self.find_picker_path(
-                                    (picker.y, picker.x), (dest_row, dest_col), picker, care_for_agents=True
+                                    (picker.y, picker.x), (dest_row, dest_col), care_for_agents=True
                                 )
                                 if new_path:
                                     logger.debug(
@@ -2731,25 +2557,31 @@ class Warehouse(gym.Env):
     def compute_valid_action_masks(self, block_conflicting_actions=True):
         requested_items = self.get_shelf_request_information()
         empty_items = self.get_empty_shelf_information()
-        carrying_shelf_info = self.get_carrying_shelf_information()
+        carrying_bin_info = self.get_carrying_bin_information()
         pickerwall_occupied = self.get_pickerwall_info()
         pickerwall_displaceable = self.get_pickerwall_displacement_info()
-        targets_agvs = [target - len(self.goals) - 1 for target in self.targets_agvs if target > len(self.goals)]
+
+        non_goal_base = self._storage_action_id_base
+        targets_agvs = [
+            target - non_goal_base
+            for target in self.targets_agvs
+            if target >= non_goal_base
+        ]
 
         valid_location_list_agvs = np.array([
-            empty_items if carrying_shelf else requested_items for carrying_shelf in carrying_shelf_info
+            empty_items if carrying_bin else requested_items for carrying_bin in carrying_bin_info
         ])
         valid_goal_list_agvs = np.array([
-            (1 - pickerwall_occupied) if carrying_shelf else pickerwall_displaceable
-            for carrying_shelf in carrying_shelf_info
+            (1 - pickerwall_occupied) if carrying_bin else pickerwall_displaceable
+            for carrying_bin in carrying_bin_info
         ])
 
         if block_conflicting_actions:
             valid_location_list_agvs[:, targets_agvs] = 0
 
         valid_action_masks = np.ones((self.num_agents, self.action_size))
-        valid_action_masks[:, 1 + len(self.goals):] = valid_location_list_agvs
-        valid_action_masks[:, 1 : 1 + len(self.goals)] = valid_goal_list_agvs
+        valid_action_masks[:, non_goal_base:] = valid_location_list_agvs
+        valid_action_masks[:, 1:non_goal_base] = valid_goal_list_agvs
         return valid_action_masks
 
     def render(self, mode="human"):

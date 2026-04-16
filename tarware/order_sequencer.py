@@ -11,7 +11,6 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from tarware.warehouse import LogicalBin
-    from tarware.warehouse import Shelf
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +91,6 @@ class OrderSequencer:
 
         self._active_queue: collections.deque[Order] = collections.deque()
         self._pending_sku_requests: collections.deque[Tuple[SKUEntry, Order]] = collections.deque()
-        self._sku_to_shelves: Dict[int, List["Shelf"]] = {}
 
         # SKUs sorted by descending frequency so the most-requested are assigned first
         sku_counts = df["SKU"].dropna().astype(int).value_counts()
@@ -182,35 +180,35 @@ class OrderSequencer:
             requeued, len(self._pending),
         )
 
-    def next_order_shelf(
-        self, candidates: Sequence["Shelf"]
-    ) -> Optional[Tuple["Shelf", "Order"]]:
-        """Pop the next pending SKU request and return the matching (shelf, order).
+    def next_order_bin(
+        self, candidates: Sequence["LogicalBin"]
+    ) -> Optional[Tuple["LogicalBin", "Order"]]:
+        """Pop the next pending SKU request and return the matching (bin, order).
 
-        Only shelves in candidates are eligible. Returns None if the queue is
-        empty or no eligible shelf exists for the front-most SKU.
+        Only bins in ``candidates`` are eligible. Returns None if the queue is
+        empty or no eligible bin exists for the front-most SKU.
         """
         if not self._pending_sku_requests:
-            logger.debug("next_order_shelf: sku request queue empty, returning None")
+            logger.debug("next_order_bin: sku request queue empty, returning None")
             return None
 
         sku_entry, order = self._pending_sku_requests.popleft()
         candidate_set = set(candidates)
 
-        for shelf in self._sku_to_shelves.get(sku_entry.sku, []):
-            if shelf in candidate_set:
+        for bin_ in self._sku_to_bins.get(sku_entry.sku, []):
+            if bin_ in candidate_set:
                 logger.debug(
-                    "next_order_shelf: order=%s sku=%d qty=%d -> shelf_id=%d (sku_requests_remaining=%d)",
-                    order.order_number, sku_entry.sku, sku_entry.quantity, shelf.id,
+                    "next_order_bin: order=%s sku=%d qty=%d -> bin_id=%d (sku_requests_remaining=%d)",
+                    order.order_number, sku_entry.sku, sku_entry.quantity, bin_.id,
                     len(self._pending_sku_requests),
                 )
-                return shelf, order
+                return bin_, order
 
         logger.warning(
-            "next_order_shelf: order=%s sku=%d has no available shelf in %d candidates "
-            "(shelves_for_sku=%d) -- SKU request consumed without fulfillment",
+            "next_order_bin: order=%s sku=%d has no available bin in %d candidates "
+            "(bins_for_sku=%d) -- SKU request consumed without fulfillment",
             order.order_number, sku_entry.sku, len(candidates),
-            len(self._sku_to_shelves.get(sku_entry.sku, [])),
+            len(self._sku_to_bins.get(sku_entry.sku, [])),
         )
         return None
 

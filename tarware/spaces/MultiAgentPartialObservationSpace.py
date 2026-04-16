@@ -52,8 +52,8 @@ class MultiAgentPartialObservationSpace(MultiAgentBaseObservationSpace):
         # Extract per-agent info
         for agent in environment.agents:
             agent_info = []
-            if agent.carrying_shelf:
-                agent_info.extend([1, int(agent.carrying_shelf in environment.request_queue)])
+            if agent.carrying_bin:
+                agent_info.extend([1, int(agent.carrying_bin in environment.request_queue)])
             else:
                 agent_info.extend([0, 0])
             agent_info.append(int(agent.req_action == Action.TOGGLE_LOAD))
