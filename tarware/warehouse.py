@@ -792,6 +792,34 @@ class Warehouse(gym.Env):
         else:
             return []
 
+    def find_picker_path_through_adjacent_loc(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
+        """Find path from start to goal that goes through via. Returns [] if no path exists."""
+        gr, gc = goal
+        rows, cols = self.grid_size
+        adjacent = [
+            (gr - 1, gc), (gr + 1, gc), (gr, gc - 1), (gr, gc + 1)
+        ]
+        entries = [
+            (r, c) for (r, c) in adjacent
+            if 0 <= r < rows and 0 <= c < cols
+            and self.picker_highways[r, c] == 1
+        ]
+        best_via = None
+        best_path: List[Tuple[int, int]] = []
+        for entry_rc in entries:
+            p = self.find_picker_path(start, entry_rc, care_for_agents)
+            if p and (not best_path or len(p) < len(best_path)):
+                best_via = entry_rc
+                best_path = p
+        via = best_via
+        path_to_via = best_path
+        if not path_to_via:
+            return []
+        path_from_via = self.find_picker_path(via, goal, care_for_agents)
+        if not path_from_via:
+            return []
+        return path_to_via + path_from_via
+
     def _recalc_grid(self) -> None:
         self.grid.fill(0)
 
@@ -1079,10 +1107,10 @@ class Warehouse(gym.Env):
     def resolve_picker_conflicts(self) -> int:
         """Graph-based conflict resolution for picker-vs-picker movement.
 
-        Builds a directed graph of (current_pos → next_pos) for all walking
+        Builds a directed graph of (current_pos -> next_pos) for all walking
         pickers, then resolves collisions:
 
-        - **2-cycles (head-on swap)**: physically impossible — reroute one
+        - **2-cycles (head-on swap)**: physically impossible - reroute one
           picker; if no alternate path exists, force it to wait.
         - **longer cycles**: all pickers in the cycle can advance safely.
         - **non-cycle collisions** (converging on same cell): one picker
@@ -1105,7 +1133,7 @@ class Warehouse(gym.Env):
             picker_at[pos] = p
             picker_next[p] = tuple(p.path[0])
 
-        # Build directed graph: current_pos → next_pos
+        # Build directed graph: current_pos -> next_pos
         G = nx.DiGraph()
         for p in walking_pickers:
             G.add_edge((p.x, p.y), picker_next[p])
@@ -1125,7 +1153,7 @@ class Warehouse(gym.Env):
                     if picker_a is None or picker_a in rerouted:
                         continue
                     dest_col, dest_row = picker_a.path[-1]
-                    new_path = self.find_picker_path(
+                    new_path = self.find_picker_path_through_adjacent_loc(
                         (picker_a.y, picker_a.x), (dest_row, dest_col),
                         care_for_agents=True,
                     )
@@ -2410,6 +2438,8 @@ class Warehouse(gym.Env):
 
     def _advance_pickers(self) -> None:
         """Drive all picker agents through their state machine each step."""
+        if len(self.pickers) > 1:
+            self.resolve_picker_conflicts()
         for picker in self.pickers:
             hf_state, hf_profile = self._picker_hf_context(picker)
 
