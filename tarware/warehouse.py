@@ -451,7 +451,7 @@ class Warehouse(gym.Env):
         replenishment cell in the map.
 
         Each shelf has ``self.bins_per_shelf`` empty bin slots. Bins are
-        not created here — they are populated later by the inventory
+        not created here - they are populated later by the inventory
         initialisation step, one LogicalBin per assigned SKU, placed into
         storage shelf slots.
         """
@@ -1076,6 +1076,101 @@ class Warehouse(gym.Env):
 
         return yields
 
+    def resolve_picker_conflicts(self) -> int:
+        """Graph-based conflict resolution for picker-vs-picker movement.
+
+        Builds a directed graph of (current_pos → next_pos) for all walking
+        pickers, then resolves collisions:
+
+        - **2-cycles (head-on swap)**: physically impossible — reroute one
+          picker; if no alternate path exists, force it to wait.
+        - **longer cycles**: all pickers in the cycle can advance safely.
+        - **non-cycle collisions** (converging on same cell): one picker
+          waits; if stuck for several ticks, reroute.
+        """
+        walking_pickers = [
+            p for p in self.pickers
+            if p.state in (PickerState.WALKING_TO_SHELF, PickerState.WALKING_TO_PACKAGING)
+            and p.path
+            and p.fixing_clash == 0
+        ]
+        if len(walking_pickers) < 2:
+            return 0
+
+        # Map each walking picker's current and intended next position
+        picker_at: dict[Tuple[int, int], "Picker"] = {}
+        picker_next: dict["Picker", Tuple[int, int]] = {}
+        for p in walking_pickers:
+            pos = (p.x, p.y)
+            picker_at[pos] = p
+            picker_next[p] = tuple(p.path[0])
+
+        # Build directed graph: current_pos → next_pos
+        G = nx.DiGraph()
+        for p in walking_pickers:
+            G.add_edge((p.x, p.y), picker_next[p])
+
+        clashes = 0
+        rerouted: set = set()
+
+        # Detect cycles
+        wcomps = [G.subgraph(c).copy() for c in nx.weakly_connected_components(G)]
+        for comp in wcomps:
+            try:
+                cycle = nx.algorithms.find_cycle(comp)
+                if len(cycle) == 2:
+                    # Head-on swap: physically impossible. Reroute one picker.
+                    node_a = cycle[0][0]
+                    picker_a = picker_at.get(node_a)
+                    if picker_a is None or picker_a in rerouted:
+                        continue
+                    dest_col, dest_row = picker_a.path[-1]
+                    new_path = self.find_picker_path(
+                        (picker_a.y, picker_a.x), (dest_row, dest_col),
+                        care_for_agents=True,
+                    )
+                    if new_path:
+                        picker_a.path = new_path
+                        picker_a.fixing_clash = _FIXING_CLASH_TIME
+                    else:
+                        picker_a.blocked_ticks += 1
+                    rerouted.add(picker_a)
+                    clashes += 1
+            except nx.NetworkXNoCycle:
+                pass
+
+        # Detect convergence: two pickers targeting the same cell
+        target_pickers: dict[Tuple[int, int], list] = {}
+        for p in walking_pickers:
+            if p in rerouted:
+                continue
+            target_pickers.setdefault(picker_next[p], []).append(p)
+
+        for target, pickers_list in target_pickers.items():
+            if len(pickers_list) < 2:
+                continue
+            # Let the closest picker proceed, reroute the rest
+            pickers_list.sort(
+                key=lambda p: abs(p.x - target[0]) + abs(p.y - target[1])
+            )
+            for p in pickers_list[1:]:
+                if p in rerouted:
+                    continue
+                dest_col, dest_row = p.path[-1]
+                new_path = self.find_picker_path(
+                    (p.y, p.x), (dest_row, dest_col),
+                    care_for_agents=True,
+                )
+                if new_path:
+                    p.path = new_path
+                    p.fixing_clash = _FIXING_CLASH_TIME
+                else:
+                    p.blocked_ticks += 1
+                rerouted.add(p)
+                clashes += 1
+
+        return clashes
+
     def resolve_stuck_agents(self) -> None:
         overall_stucks = 0
         moving_agents = [
@@ -1163,7 +1258,7 @@ class Warehouse(gym.Env):
             matched_sku_entry = next(
                 (se for se in delivered_order.skus if se.sku == bin_.sku), None
             )
-            if matched_sku_entry is not None and self.num_pickers > 0:
+            if matched_sku_entry is not None:
                 self._pickerwall_pending.append((bin_.id, matched_sku_entry, delivered_order))
             logger.info(
                 "step=%d delivery: bin_id=%d sku=%s arrived for order=%s "
@@ -1172,27 +1267,8 @@ class Warehouse(gym.Env):
                 len(self._pickerwall_pending),
             )
 
-        new_candidates = self._storage_bin_candidates()
-        result = self.order_sequencer.next_order_bin(new_candidates)
-        if result is not None:
-            new_bin, new_order = result
-            self._bin_to_order[new_bin.id] = new_order
-            logger.info(
-                "step=%d delivery: bin_id=%d sku=%s delivered - "
-                "replaced in queue with bin_id=%d sku=%d (pending=%d active=%d)",
-                self._cur_steps, bin_.id, bin_.sku,
-                new_bin.id, new_bin.sku,
-                self.order_sequencer.pending_count, self.order_sequencer.active_count,
-            )
-            self.request_queue[self.request_queue.index(bin_)] = new_bin
-        else:
-            logger.info(
-                "step=%d delivery: bin_id=%d sku=%s delivered - "
-                "no matching active order (pending=%d active=%d)",
-                self._cur_steps, bin_.id, bin_.sku,
-                self.order_sequencer.pending_count, self.order_sequencer.active_count,
-            )
-            self.request_queue.remove(bin_)
+        self.request_queue.remove(bin_)
+        self._refill_request_queue()
         self._step_deliveries += 1
         return rewards
 
@@ -1531,7 +1607,7 @@ class Warehouse(gym.Env):
 
         Picker.counter = 0
         self.pickers = []
-        if self.num_pickers > 0 and len(self.picker_spawn_locs) > 0:
+        if len(self.picker_spawn_locs) > 0:
             picker_spawn_specs = self._balanced_picker_spawn_specs()
             for picker_index, (py, px, home_zone) in enumerate(picker_spawn_specs):
                 picker = Picker(int(px), int(py), Direction.UP)
@@ -1571,14 +1647,7 @@ class Warehouse(gym.Env):
             released = self.order_sequencer.release_pending_orders(0)
             logger.info("reset: released %d orders at t=0 (queue capacity=%d)", len(released), self.request_queue_size)
             self.request_queue = []
-            for _ in range(self.request_queue_size):
-                candidates = self._storage_bin_candidates()
-                result = self.order_sequencer.next_order_bin(candidates)
-                if result is None:
-                    break
-                bin_, order = result
-                self._bin_to_order[bin_.id] = order
-                self.request_queue.append(bin_)
+            self._refill_request_queue()
             logger.info(
                 "reset: initial request_queue filled=%d/%d skus=%s",
                 len(self.request_queue), self.request_queue_size,
@@ -1598,30 +1667,149 @@ class Warehouse(gym.Env):
         self.observation_space_mapper.extract_environment_info(self)
         return tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
 
+    def _next_order_assignment(
+        self,
+    ) -> Optional[Tuple["LogicalBin", "SKUEntry", "Order", str]]:
+        """Find the first currently-fulfillable SKU request and remove it.
+
+        Scans ``_pending_sku_requests`` and looks up the (typically single)
+        non-depleted bin for each SKU via ``_sku_to_bins``.  The bin's
+        current location determines the match type:
+
+        - **in_transit** - being carried to the pickerwall (carried + in
+          ``request_queue``).  Picker can be queued ahead of arrival.
+        - **pickerwall** - already resting on the pickerwall.
+        - **storage** - on a storage shelf, available for AGV fetch.
+        - **returning** - being carried *away* from the pickerwall (e.g.
+          displacement).  The bin is un-fulfilled so the heuristic cancels
+          the displacement mission; the request is left in the deque for
+          retry once the bin lands back on a shelf.
+
+        Returns ``(bin, sku_entry, order, match_type)`` or None.
+        """
+        carried_ids = {a.carrying_bin.id for a in self.agents if a.carrying_bin}
+        queued_ids = {b.id for b in self.request_queue if b is not None}
+
+        for i in range(len(self.order_sequencer._pending_sku_requests)):
+            sku_entry, order = self.order_sequencer._pending_sku_requests[i]
+            bins_for_sku = self.order_sequencer._sku_to_bins.get(sku_entry.sku, [])
+
+            for bin_ in bins_for_sku:
+                if bin_.depleted:
+                    continue
+
+                # Being carried to the pickerwall for another order
+                if bin_.id in carried_ids and bin_.id in queued_ids:
+                    del self.order_sequencer._pending_sku_requests[i]
+                    return bin_, sku_entry, order, "in_transit"
+
+                # Being carried away (displacement) - un-fulfill so the
+                # heuristic cancels the mission; leave request for retry.
+                if bin_.id in carried_ids:
+                    if bin_.fulfilled:
+                        bin_.fulfilled = False
+                        logger.info(
+                            "step=%d: bin_id=%d sku=%s un-fulfilled - "
+                            "being displaced but needed by order=%s",
+                            self._cur_steps, bin_.id, bin_.sku,
+                            order.order_number,
+                        )
+                    break  # can't use this bin yet; skip to next request
+
+                if not bin_.on_shelf:
+                    continue
+                shelf = self.shelves_by_id.get(bin_.shelf_id)
+                if shelf is None:
+                    continue
+
+                if shelf.cell_type == BinCellType.PICKERWALL:
+                    del self.order_sequencer._pending_sku_requests[i]
+                    return bin_, sku_entry, order, "pickerwall"
+
+                if (shelf.cell_type == BinCellType.STORAGE
+                        and bin_.id not in queued_ids):
+                    del self.order_sequencer._pending_sku_requests[i]
+                    return bin_, sku_entry, order, "storage"
+
+        return None
+
     def _refill_request_queue(self) -> None:
-        """Fill the request queue from active orders up to request_queue_size."""
+        """Fill the request queue up to request_queue_size using _next_order_assignment.
+
+        Match types from ``_next_order_assignment``:
+
+        - **in_transit**: bin is being carried to pickerwall for another order.
+          Add pick to ``_pickerwall_pending`` so the picker is ready when it
+          arrives.  No queue slot consumed.
+        - **pickerwall**: bin already on pickerwall.  Un-fulfill it and add
+          pick to ``_pickerwall_pending``.  No queue slot consumed.
+        - **storage**: bin in storage.  Add to ``request_queue`` for AGV fetch.
+        """
         if self.order_sequencer is None:
             return
+
+        # Sort so requests whose SKU is already on the pickerwall come first -
+        # they don't consume queue slots, leaving more room for storage fetches.
+        pw_skus: set = set()
+        for shelf in self.pickerwall_shelves:
+            for bin_ in shelf.bin_slots:
+                if bin_ is not None and bin_.sku is not None and not bin_.depleted:
+                    pw_skus.add(bin_.sku)
+        self.order_sequencer.sort_pending_sku_requests(pw_skus)
+
+        resolved_without_slot = 0
         while len(self.request_queue) < self.request_queue_size:
-            candidates = self._storage_bin_candidates()
-            result = self.order_sequencer.next_order_bin(candidates)
+            result = self._next_order_assignment()
             if result is None:
-                logger.debug(
-                    "step=%d _refill: active queue empty or no matching bin - "
-                    "queue stays at %d/%d",
-                    self._cur_steps, len(self.request_queue), self.request_queue_size,
-                )
                 break
-            bin_, order = result
+            bin_, sku_entry, order, match_type = result
+
+            if match_type == "in_transit":
+                # Bin already being carried to pickerwall - queue the pick
+                if self.num_pickers > 0:
+                    self._pickerwall_pending.append((bin_.id, sku_entry, order))
+                resolved_without_slot += 1
+                logger.info(
+                    "step=%d _refill: bin_id=%d sku=%s in transit to pickerwall - "
+                    "queued pick for order=%s",
+                    self._cur_steps, bin_.id, bin_.sku, order.order_number,
+                )
+                # Continue here, as we still haven't filled up the request queue
+                continue
+
+            if match_type == "pickerwall":
+                # Already on the pickerwall - resolve directly
+                if bin_.fulfilled:
+                    bin_.fulfilled = False
+                    logger.info(
+                        "step=%d: bin_id=%d sku=%s un-fulfilled - "
+                        "SKU needed by order=%s (already on pickerwall)",
+                        self._cur_steps, bin_.id, bin_.sku, order.order_number,
+                    )
+                if self.num_pickers > 0:
+                    self._pickerwall_pending.append((bin_.id, sku_entry, order))
+                resolved_without_slot += 1
+                # Continue here, as we still haven't filled up the request queue
+                continue
+
+            # Storage (or returning) - queue for AGV fetch
             self._bin_to_order[bin_.id] = order
+            self.request_queue.append(bin_)
             logger.info(
                 "step=%d _refill: added bin_id=%d sku=%d to request_queue "
                 "(queue=%d/%d pending=%d active=%d)",
                 self._cur_steps, bin_.id, bin_.sku,
-                len(self.request_queue) + 1, self.request_queue_size,
+                len(self.request_queue), self.request_queue_size,
                 self.order_sequencer.pending_count, self.order_sequencer.active_count,
             )
-            self.request_queue.append(bin_)
+        if resolved_without_slot:
+            logger.info(
+                "step=%d _refill: resolved %d SKU requests without queue slot "
+                "(in_transit + pickerwall) remaining_sku_requests=%d queue=%d/%d",
+                self._cur_steps, resolved_without_slot,
+                len(self.order_sequencer._pending_sku_requests),
+                len(self.request_queue), self.request_queue_size,
+            )
 
     def _resolve_pickerwall_bin_for_sku(self, sku: int) -> int:
         """Return the bin_id of a bin resting in a pickerwall shelf with the given SKU.
@@ -2428,8 +2616,7 @@ class Warehouse(gym.Env):
         rewards -= 0.001
         self._step_deliveries = 0
         rewards = self.execute_micro_actions(rewards)
-        if self.num_pickers > 0:
-            self._advance_pickers()
+        self._advance_pickers()
         rewards, shelf_deliveries = self.process_shelf_deliveries(rewards)
 
         self._recalc_grid()

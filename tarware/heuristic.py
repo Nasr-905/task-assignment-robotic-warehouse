@@ -164,6 +164,29 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 assigned_agvs.pop(agv)
                 assigned_items.pop(agv, None)
 
+        # cancel displacement missions whose target bin is no longer fulfilled
+        # (e.g. a new order arrived for that SKU, so it should stay on the wall)
+        cancel_list = []
+        for agv, mission in assigned_agvs.items():
+            if mission.mission_type != MissionType.PICKING:
+                continue
+            if (mission.location_x, mission.location_y) not in goal_locations:
+                continue  # not a pickerwall displacement
+            if agv.carrying_bin is not None:
+                continue  # already picked up, too late to cancel
+            shelf = env.shelves_by_xy.get((mission.location_x, mission.location_y))
+            if shelf is None:
+                continue
+            shelf_id, slot_idx = env.action_id_to_slot.get(mission.location_id, (None, None))
+            if shelf_id is None:
+                continue
+            bin_ = env.shelves_by_id[shelf_id].bin_slots[slot_idx]
+            if bin_ is None or not bin_.fulfilled:
+                cancel_list.append(agv)
+        for agv in cancel_list:
+            assigned_agvs.pop(agv)
+            assigned_items.pop(agv, None)
+
         # displacement: clear fulfilled pickerwall slots when above occupancy threshold.
         # Occupancy and threshold are computed at slot granularity (not cell).
         DISPLACEMENT_THRESHOLD = 0.7

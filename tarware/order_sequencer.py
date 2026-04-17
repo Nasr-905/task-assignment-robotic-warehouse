@@ -5,7 +5,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Set
 
 import pandas as pd
 
@@ -179,6 +179,15 @@ class OrderSequencer:
             "OrderSequencer reset: re-queued=%d total_pending=%d",
             requeued, len(self._pending),
         )
+
+    def sort_pending_sku_requests(self, pickerwall_skus: Set[int]) -> None:
+        """Reorder pending SKU requests so those with SKUs in pickerwall_skus come first."""
+        if pickerwall_skus is None:
+            return
+        pending_skus = list(self._pending_sku_requests)
+        pending_skus.sort(key=lambda pair: (0 if pair[0].sku in pickerwall_skus else 1))
+        self._pending_sku_requests.clear()
+        self._pending_sku_requests.extend(pending_skus)
 
     def next_order_bin(
         self, candidates: Sequence["LogicalBin"]
