@@ -1099,6 +1099,14 @@ class Warehouse(gym.Env):
                     (agent.path[-1][1], agent.path[-1][0]),
                     care_for_agents=True,
                 )
+                if len(new_path) == 1:
+                    # Agents that are stuck and are 1 cell away from their target are likely competing with a picker that has
+                    # the same dilemma, so, re-route agent to the target through an adjacent cell to the target.
+                    new_path = self.find_agv_path_through_adjacent_loc(
+                        (agent.y, agent.x),
+                        (agent.path[-1][1], agent.path[-1][0]),
+                        care_for_agents=True,
+                    )
                 if new_path:
                     agent.path = new_path
 
@@ -1153,10 +1161,15 @@ class Warehouse(gym.Env):
                     if picker_a is None or picker_a in rerouted:
                         continue
                     dest_col, dest_row = picker_a.path[-1]
-                    new_path = self.find_picker_path_through_adjacent_loc(
+                    new_path = self.find_picker_path(
                         (picker_a.y, picker_a.x), (dest_row, dest_col),
                         care_for_agents=True,
                     )
+                    if len(new_path) == 1:
+                        new_path = self.find_picker_path_through_adjacent_loc(
+                            (picker_a.y, picker_a.x), (dest_row, dest_col),
+                            care_for_agents=True,
+                        )
                     if new_path:
                         picker_a.path = new_path
                         picker_a.fixing_clash = _FIXING_CLASH_TIME
