@@ -27,7 +27,7 @@ import numpy as np
 # ============================================================
 
 # Catalog & volume
-NUM_SKUS        = 360    # unique SKUs in the catalogue
+NUM_SKUS        = 1080    # unique SKUs in the catalogue
 NUM_TIME_BUCKETS = 180   # number of 60-second windows to simulate
 
 # Poisson rate: expected orders arriving per 60-second window.
