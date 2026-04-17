@@ -42,10 +42,19 @@ _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
 # - 5: replenishment (AGV take-only)
 # - 6: shared highway
 _AGV_WALKABLE_TILES = {0, 6}
+_AGV_LOADABLE_TILES = {0}
 _PICKER_WALKABLE_TILES = {3, 4, 6}
+_PICKER_LOADABLE_TILES = {3, 4}
 _SHARED_HIGHWAY_TILE = 6
 BIN_VOLUME_FT3 = 2.68
 BIN_USABLE_FRACTION = 0.85
+
+# Pickerwall pending priority weights (higher score = picked sooner)
+PICKER_PRIORITY_COMPLETION_WEIGHT = 0.0   # boost orders close to finishing
+PICKER_PRIORITY_COMPLETION_EXPONENT = 0.5 # non-linear curve (sqrt)
+PICKER_PRIORITY_SKU_BATCH_WEIGHT = 0.0    # reward batching same-SKU picks
+PICKER_PRIORITY_SKU_BATCH_CAP = 5         # normalize sku count up to this value
+PICKER_PRIORITY_AGE_WEIGHT = 1.0          # prevent starvation of old orders
 
 
 class BinCellType(Enum):
@@ -363,7 +372,7 @@ class Warehouse(gym.Env):
         self.pickers: List[Picker] = []
         self.stuck_counters = []
         self.renderer = None
-        self._bin_to_order: Dict[int, Any] = {}  # bin_id -> Order that triggered its fetch
+        self._bin_to_order: Dict[int, list] = {}  # bin_id -> [(sku_entry, Order), ...]
         self._packaging_slots: Dict[str, Dict[str, Any]] = {}  # order_number -> {required, delivered, station}
         self._pickerwall_pending: deque = deque()  # (bin_id, SKUEntry, Order) populated on delivery
         self._reserved_slots: Dict[Tuple[int, int], int] = {}  # (shelf_id, slot_idx) -> bin_id
@@ -518,6 +527,18 @@ class Warehouse(gym.Env):
             if tile_grid[r, c] == _SHARED_HIGHWAY_TILE
         ]
 
+        # Loadable tiles: loadings and unloadings should only occur in loadable areas,
+        # which is dfiferent from highways (the shared space is ignored).
+        self.loadable_tiles = np.zeros(self.grid_size, dtype=np.int32)
+        self.picker_loadable_tiles = np.zeros(self.grid_size, dtype=np.int32)
+        for r in range(num_rows):
+            for c in range(num_cols):
+                t = tile_grid[r, c]
+                if t in _AGV_LOADABLE_TILES:
+                    self.loadable_tiles[r, c] = 1
+                if t in _PICKER_LOADABLE_TILES:
+                    self.picker_loadable_tiles[r, c] = 1
+
         # Goals (pickerwall), packaging locations (stored as (x, y) = (col, row))
         self.goals: List[Tuple[int, int]] = [
             (c, r)
@@ -574,7 +595,7 @@ class Warehouse(gym.Env):
                 (nx, ny)
                 for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)]
                 if 0 <= ny < num_rows and 0 <= nx < num_cols
-                and self.picker_highways[ny, nx] == 1
+                and self.picker_loadable_tiles[ny, nx] == 1
             ]
             self._goal_to_picker_entry[(gx, gy)] = entries
 
@@ -586,7 +607,7 @@ class Warehouse(gym.Env):
                 (nx, ny)
                 for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)]
                 if 0 <= ny < num_rows and 0 <= nx < num_cols
-                and self.highways[ny, nx] == 1       # AGV-walkable
+                and self.loadable_tiles[ny, nx] == 1       # AGV-walkable
             ]
             self._goal_to_agv_entry[(gx, gy)] = entries
 
@@ -1299,17 +1320,15 @@ class Warehouse(gym.Env):
         elif self.reward_type == RewardType.INDIVIDUAL:
             rewards[agent.id - 1] += 1
 
-        delivered_order = self._bin_to_order.pop(bin_.id, None)
-        if delivered_order is not None:
-            matched_sku_entry = next(
-                (se for se in delivered_order.skus if se.sku == bin_.sku), None
-            )
-            if matched_sku_entry is not None:
-                self._pickerwall_pending.append((bin_.id, matched_sku_entry, delivered_order))
+        pending_entries = self._bin_to_order.pop(bin_.id, [])
+        for sku_entry, delivered_order in pending_entries:
+            self._pickerwall_pending.append((bin_.id, sku_entry, delivered_order))
+        if pending_entries:
             logger.info(
-                "step=%d delivery: bin_id=%d sku=%s arrived for order=%s "
-                "(pickerwall_pending=%d)",
-                self._cur_steps, bin_.id, bin_.sku, delivered_order.order_number,
+                "step=%d delivery: bin_id=%d sku=%s arrived - queued %d pick(s) "
+                "for order(s)=%s (pickerwall_pending=%d)",
+                self._cur_steps, bin_.id, bin_.sku, len(pending_entries),
+                [o.order_number for _, o in pending_entries],
                 len(self._pickerwall_pending),
             )
 
@@ -1528,11 +1547,19 @@ class Warehouse(gym.Env):
         bins_for_sku = self.order_sequencer._sku_to_bins.get(bin_.sku)
         if not bins_for_sku:
             return
-        self.order_sequencer._sku_to_bins[bin_.sku] = [
+        remaining = [
             candidate
             for candidate in bins_for_sku
             if candidate.id != bin_.id
         ]
+        # This is left in to determine if replenishment is working properly
+        self.order_sequencer._sku_to_bins[bin_.sku] = remaining
+        if not remaining:
+            logger.warning(
+                "step=%d: SKU %s has NO remaining bins after removing "
+                "bin_id=%d (depleted=%s)",
+                self._cur_steps, bin_.sku, bin_.id, bin_.depleted,
+            )
 
     def _make_new_bin(self, cell_type: BinCellType, x: int, y: int) -> LogicalBin:
         """Build a fresh LogicalBin with a unique id."""
@@ -1804,23 +1831,24 @@ class Warehouse(gym.Env):
         self.order_sequencer.sort_pending_sku_requests(pw_skus)
 
         resolved_without_slot = 0
-        while len(self.request_queue) < self.request_queue_size:
+        while True:
             result = self._next_order_assignment()
             if result is None:
                 break
             bin_, sku_entry, order, match_type = result
 
             if match_type == "in_transit":
-                # Bin already being carried to pickerwall - queue the pick
-                if self.num_pickers > 0:
-                    self._pickerwall_pending.append((bin_.id, sku_entry, order))
+                # Bin already being carried to pickerwall - stash alongside
+                # the original storage entry so _deliver_to_pickerwall adds
+                # ALL pending picks to _pickerwall_pending in one shot.
+                self._bin_to_order.setdefault(bin_.id, []).append((sku_entry, order))
                 resolved_without_slot += 1
                 logger.info(
                     "step=%d _refill: bin_id=%d sku=%s in transit to pickerwall - "
-                    "queued pick for order=%s",
+                    "stashed pick for order=%s (pending_for_bin=%d)",
                     self._cur_steps, bin_.id, bin_.sku, order.order_number,
+                    len(self._bin_to_order.get(bin_.id, [])),
                 )
-                # Continue here, as we still haven't filled up the request queue
                 continue
 
             if match_type == "pickerwall":
@@ -1835,11 +1863,16 @@ class Warehouse(gym.Env):
                 if self.num_pickers > 0:
                     self._pickerwall_pending.append((bin_.id, sku_entry, order))
                 resolved_without_slot += 1
-                # Continue here, as we still haven't filled up the request queue
                 continue
 
-            # Storage (or returning) - queue for AGV fetch
-            self._bin_to_order[bin_.id] = order
+            # Storage - queue for AGV fetch (only if there's room)
+            if len(self.request_queue) >= self.request_queue_size:
+                # Put the request back - we can't queue it yet
+                self.order_sequencer._pending_sku_requests.appendleft(
+                    (sku_entry, order)
+                )
+                break
+            self._bin_to_order.setdefault(bin_.id, []).append((sku_entry, order))
             self.request_queue.append(bin_)
             logger.info(
                 "step=%d _refill: added bin_id=%d sku=%d to request_queue "
@@ -1917,17 +1950,27 @@ class Warehouse(gym.Env):
             bin_ = self._bins_by_id.get(bin_id)
 
             if bin_ is None or bin_.shelf_id is None:
-                logger.debug(
-                    "step=%d _claim: skipping stale pickerwall_pending bin_id=%d",
-                    self._cur_steps, bin_id,
+                logger.info(
+                    "step=%d _claim: bin_id=%d no longer on shelf - "
+                    "returning sku=%d order=%s to pending_sku_requests",
+                    self._cur_steps, bin_id, sku_entry.sku, order.order_number,
                 )
+                if self.order_sequencer is not None:
+                    self.order_sequencer._pending_sku_requests.appendleft(
+                        (sku_entry, order)
+                    )
                 continue
             shelf = self.shelves_by_id.get(bin_.shelf_id)
             if shelf is None or shelf.cell_type != BinCellType.PICKERWALL:
-                logger.debug(
-                    "step=%d _claim: bin_id=%d no longer on pickerwall",
-                    self._cur_steps, bin_id,
+                logger.info(
+                    "step=%d _claim: bin_id=%d no longer on pickerwall - "
+                    "returning sku=%d order=%s to pending_sku_requests",
+                    self._cur_steps, bin_id, sku_entry.sku, order.order_number,
                 )
+                if self.order_sequencer is not None:
+                    self.order_sequencer._pending_sku_requests.appendleft(
+                        (sku_entry, order)
+                    )
                 continue
 
             if zone_id is None or self._bin_pickerwall_zone(bin_id) == zone_id:
@@ -2454,10 +2497,84 @@ class Warehouse(gym.Env):
 
         return max(1, self.simulated_seconds_to_steps(total_seconds))
 
+    def _pickerwall_pending_priority(
+        self,
+        entry: Tuple[int, "SKUEntry", "Order"],
+        sku_counts: Dict[int, int],
+        min_time: float,
+        time_range: float,
+        simulated_seconds: float,
+    ) -> float:
+        """Score a pickerwall_pending entry for sorting (higher = picked sooner).
+
+        Override this method to swap in a different priority strategy.
+
+        Parameters
+        ----------
+        entry : (bin_id, sku_entry, order)
+        sku_counts : mapping of sku -> number of pending picks for that sku
+        min_time : earliest order creation time among all pending entries
+        time_range : span between earliest and latest creation times (>0)
+        simulated_seconds : current simulation time in seconds
+        """
+        _bin_id, sku_entry, order = entry
+
+        # Compute completion ratio for the order, the number of units filled / total units
+        slot = self._packaging_slots.get(order.order_number)
+        if slot and slot["required"] > 0:
+            completion_ratio = slot["delivered"] / slot["required"]
+        else:
+            completion_ratio = 0.0
+        completion_score = completion_ratio ** PICKER_PRIORITY_COMPLETION_EXPONENT
+
+        # Compute SKU batching score to prioritize picking multiple items of the same SKU together
+        sku_count = sku_counts.get(sku_entry.sku, 1)
+        sku_batch_score = min(sku_count / PICKER_PRIORITY_SKU_BATCH_CAP, 1.0)
+
+        # Compute the amount of time the order has been in the system
+        if time_range > 0:
+            age_score = 1.0 - (order.time_created_seconds - min_time) / time_range
+        else:
+            age_score = 0.5
+
+        return (
+            PICKER_PRIORITY_COMPLETION_WEIGHT * completion_score
+            + PICKER_PRIORITY_SKU_BATCH_WEIGHT * sku_batch_score
+            + PICKER_PRIORITY_AGE_WEIGHT * age_score
+        )
+
+    def _sort_pickerwall_pending(self) -> None:
+        """Sort _pickerwall_pending so the highest-priority picks come first."""
+        if len(self._pickerwall_pending) < 2:
+            return
+
+        # Pre-compute shared context once
+        sku_counts: Dict[int, int] = {}
+        times: List[float] = []
+        for _bid, se, order in self._pickerwall_pending:
+            sku_counts[se.sku] = sku_counts.get(se.sku, 0) + 1
+            times.append(order.time_created_seconds)
+
+        min_time = min(times)
+        max_time = max(times)
+        time_range = max_time - min_time if max_time > min_time else 1.0
+        sim_seconds = self._cur_steps / max(1e-6, self.steps_per_simulated_second)
+
+        items = list(self._pickerwall_pending)
+        items.sort(
+            key=lambda e: self._pickerwall_pending_priority(
+                e, sku_counts, min_time, time_range, sim_seconds
+            ),
+            reverse=True,
+        )
+        self._pickerwall_pending.clear()
+        self._pickerwall_pending.extend(items)
+
     def _advance_pickers(self) -> None:
         """Drive all picker agents through their state machine each step."""
         if len(self.pickers) > 1:
             self.resolve_picker_conflicts()
+        self._sort_pickerwall_pending()
         for picker in self.pickers:
             hf_state, hf_profile = self._picker_hf_context(picker)
 
