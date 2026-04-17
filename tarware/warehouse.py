@@ -1202,6 +1202,11 @@ class Warehouse(gym.Env):
                     (p.y, p.x), (dest_row, dest_col),
                     care_for_agents=True,
                 )
+                if len(new_path) == 1:
+                    new_path = self.find_picker_path_through_adjacent_loc(
+                        (p.y, p.x), (dest_row, dest_col),
+                        care_for_agents=True,
+                    )
                 if new_path:
                     p.path = new_path
                     p.fixing_clash = _FIXING_CLASH_TIME
