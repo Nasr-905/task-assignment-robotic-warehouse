@@ -34,19 +34,22 @@ SET_DEFAULT=False
 TARWARE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAPS_DIR    = os.path.join(TARWARE_DIR, "data", "maps")
 MAP_FORMAT_PATH = os.path.join(MAPS_DIR, "map_format.json")
-OUTPUT_NAME     = "tiny_dhl"   # -> image_recreation.csv / .json
+OUTPUT_NAME     = "large_dhl"   # -> image_recreation.csv / .json
 
 # Bay-level structural parameters
-N_SECTIONS           = 1    # number of horizontal sections (Default: 4)
-SECTION_HEIGHT       = 1    # bay-rows per section (Default: 10)
+N_SECTIONS           = 2    # number of horizontal sections (Default: 4)
+SECTION_HEIGHT       = 4    # bay-rows per section (Default: 10)
 SECTION_VERTICAL_GAP = 2    # bay-rows between sections (Default: 8)
 
 # Outer margins
 LEFT_MARGIN  = 2            # empty cols before the first storage block on the left (Default: 4)
 RIGHT_MARGIN = 2            # empty cols after the last replenishment block on the right (Default: 4)
 
+# AGV idle zone
+AGV_IDLE_ZONE_HEIGHT = 0    # number of rows at the top of the map for AGV idle zone (Default: 0)
+
 # Storage blocks
-STORAGE_REPEATS     = 1    # number of storage blocks in each storage region (Default: 18) 
+STORAGE_REPEATS     = 5    # number of storage blocks in each storage region (Default: 18) 
 STORAGE_BLOCK_WIDTH = 1     # cols per storage block (Default: 1)
 STORAGE_COLUMN_GAP  = 2     # empty cols between adjacent storage blocks (Default: 2)
 
@@ -79,6 +82,7 @@ if SET_DEFAULT:
     SECTION_VERTICAL_GAP = 8
     LEFT_MARGIN = 4
     RIGHT_MARGIN = 4
+    AGV_IDLE_ZONE_HEIGHT = 0
     STORAGE_REPEATS = 18
     STORAGE_BLOCK_WIDTH = 1
     STORAGE_COLUMN_GAP = 2
@@ -105,6 +109,7 @@ REPLENISHMENT_CHAR = "r"
 AGV_AISLE_CHAR     = "3"
 PACKAGING_CHAR     = "4"
 HIGHWAY_CHAR       = "6"
+IDLE_ZONE_CHAR     = "7"
 EMPTY_CHAR         = "0"
 
 # Shelf-map numeric codes produced by the expansion step
@@ -112,6 +117,7 @@ CHAR_TO_NUMERIC = {
     STORAGE_CHAR:       "1",
     PICKWALL_CHAR:      "2",
     REPLENISHMENT_CHAR: "5",
+    IDLE_ZONE_CHAR:     "7",
 }
 
 
@@ -199,11 +205,17 @@ def build_bay_map():
         + RIGHT_MARGIN
     )
     height = (
-        N_SECTIONS * SECTION_HEIGHT
+        AGV_IDLE_ZONE_HEIGHT
+        + N_SECTIONS * SECTION_HEIGHT
         + (N_SECTIONS + 1) * SECTION_VERTICAL_GAP
     )
 
     grid = [[EMPTY_CHAR for _ in range(width)] for _ in range(height)]
+
+    # Add the AGV idle zone at the top
+    for r in range(AGV_IDLE_ZONE_HEIGHT):
+        for c in range(width):
+            grid[r][c] = IDLE_ZONE_CHAR
 
     pickwall_start_col = LEFT_MARGIN + left_storage_width + STORAGE_TO_PICKWALL_GAP
     pickwall_end_col   = pickwall_start_col + pickwall_width
@@ -211,15 +223,45 @@ def build_bay_map():
     # Only the pickwall span of the horizontal cross-aisle bands is shared;
     # the rest stays AGV-only highway.
     for band in range(N_SECTIONS + 1):
-        row_start = band * (SECTION_HEIGHT + SECTION_VERTICAL_GAP)
+        row_start = AGV_IDLE_ZONE_HEIGHT + band * (SECTION_HEIGHT + SECTION_VERTICAL_GAP)
         for r in range(row_start, row_start + SECTION_VERTICAL_GAP):
             if r >= height:
                 continue
+
+            gap_offset = r - row_start
+
+            # Always set pickwall region to highway (shared section)
             for c in range(pickwall_start_col, pickwall_end_col):
                 grid[r][c] = HIGHWAY_CHAR
 
+            if SECTION_VERTICAL_GAP >= 2:
+                # Check if this is a top or bottom divider
+                is_top_divider = (band == 0)
+                is_bottom_divider = (band == N_SECTIONS)
+                is_first_row = (gap_offset == 0)
+                is_last_row = (gap_offset == SECTION_VERTICAL_GAP - 1)
+
+                # Determine if this row should get idle zones
+                should_fill_idle = False
+
+                if is_top_divider:
+                    # Top divider: fill all rows except the last (which touches the section)
+                    should_fill_idle = not is_last_row
+                elif is_bottom_divider:
+                    # Bottom divider: fill all rows except the first (which touches the section)
+                    should_fill_idle = not is_first_row
+                else:
+                    # Middle dividers: all rows touch a section (sandwiched), so no idle zones
+                    should_fill_idle = False
+
+                if should_fill_idle:
+                    for c in range(width):
+                        if c < pickwall_start_col or c >= pickwall_end_col:
+                            if grid[r][c] == EMPTY_CHAR:
+                                grid[r][c] = IDLE_ZONE_CHAR
+
     for section in range(N_SECTIONS):
-        row_start = SECTION_VERTICAL_GAP + section * (
+        row_start = AGV_IDLE_ZONE_HEIGHT + SECTION_VERTICAL_GAP + section * (
             SECTION_HEIGHT + SECTION_VERTICAL_GAP
         )
         for r in range(row_start, row_start + SECTION_HEIGHT):

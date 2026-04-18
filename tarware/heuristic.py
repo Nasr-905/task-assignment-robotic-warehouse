@@ -12,6 +12,7 @@ class MissionType(Enum):
     PICKING = 1     # travel to a location (rack or replenishment zone) and pick up the shelf
     RETURNING = 2   # carry a shelf to an empty rack slot and deposit it
     DELIVERING = 3  # carry a shelf to an empty pickerwall slot and deposit it
+    IDLE = 4        # park in an AGV idle zone so pickerwall / highway stay clear
 
 
 @dataclass
@@ -25,13 +26,24 @@ class Mission:
 
 
 def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=0, render_sleep=0.0):
-    # non_goal_location_ids aligns with the index ordering of get_empty_shelf_information
+    # non_goal_location_ids aligns with the index ordering of get_empty_shelf_information.
+    # Idle-zone action IDs sit after replenishment in action_id_to_coords_map, so we
+    # cap the iteration at _idle_action_id_base to keep the 1:1 mapping with the
+    # occupancy arrays returned by get_empty_shelf_information / get_empty_replenishment_information.
+    idle_action_base = getattr(env, "_idle_action_id_base", None)
     non_goal_location_ids = []
     for id_, coords in env.action_id_to_coords_map.items():
+        if idle_action_base is not None and id_ >= idle_action_base:
+            continue
         if (coords[1], coords[0]) not in env.goals:
             non_goal_location_ids.append(id_)
     non_goal_location_ids = np.array(non_goal_location_ids)
     location_map = env.action_id_to_coords_map
+    idle_zone_action_ids = list(getattr(env, "idle_zone_action_ids", []))
+    idle_action_id_to_xy = {
+        aid: (location_map[aid][1], location_map[aid][0])  # (col, row)
+        for aid in idle_zone_action_ids
+    }
     _ = env.reset(seed=seed)
     done = False
     all_infos = []
@@ -87,6 +99,10 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                     goal_xy = (m.location_x, m.location_y)
                     entry_cells = env._goal_to_agv_entry.get(goal_xy, [])
                     if (agv.x, agv.y) in entry_cells:
+                        assigned_agvs[agv].at_location = True
+                elif m.mission_type == MissionType.IDLE:
+                    # IDLE: AGV parks ON the idle cell itself (tile 7 is walkable).
+                    if (agv.x, agv.y) == (m.location_x, m.location_y):
                         assigned_agvs[agv].at_location = True
                 else:
                     # PICKING / RETURNING: AGV stops adjacent to its target cell.
@@ -206,10 +222,34 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
         ]
 
         effective_occupied = occupied_count - len(displacement_reserved_ids)
+        effective_open = total_slots - effective_occupied
+
+        def _is_idle_preemptable(agv):
+            """True if this AGV is currently on an IDLE mission and can be
+            redirected to real work without leaking any state."""
+            m = assigned_agvs.get(agv)
+            return m is not None and m.mission_type == MissionType.IDLE and not agv.carrying_bin
+
+        def _claim_agv(agv):
+            """Release an AGV from any active IDLE mission so it's ready for a new one.
+            Cancels the in-flight env path so the new macro action plans fresh this tick."""
+            if _is_idle_preemptable(agv):
+                if agv.busy:
+                    env.cancel_agv_motion(agv)
+                assigned_agvs.pop(agv, None)
+
+        def _available_agvs():
+            """AGVs free to receive a new real-work mission. Includes AGVs
+            currently on an IDLE mission (they'll be preempted on assignment)."""
+            return [
+                a for a in agvs
+                if not a.carrying_bin
+                and (a not in assigned_agvs or _is_idle_preemptable(a))
+                and (not a.busy or _is_idle_preemptable(a))
+            ]
 
         if displaceable_goals and total_slots and effective_occupied / total_slots >= DISPLACEMENT_THRESHOLD:
-            free_agvs = [a for a in agvs if not a.busy and not a.carrying_bin
-                         and a not in assigned_agvs]
+            free_agvs = _available_agvs()
             for goal_xy in displaceable_goals:
                 if not free_agvs:
                     break
@@ -225,38 +265,71 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 if all(d == float('inf') for d in agv_dists):
                     continue  # no AGV can reach this displacement goal; try next
                 chosen = free_agvs[np.argmin(agv_dists)]
+                _claim_agv(chosen)
                 assigned_agvs[chosen] = Mission(MissionType.PICKING, goal_id,
                                                 goal_xy[0], goal_xy[1], timestep)
                 displacement_reserved_ids.add(goal_id)
                 effective_occupied -= 1
                 free_agvs.remove(chosen)
 
-        # fetch missions: assign remaining free AGVs to requested shelves
-        for item in request_queue:
-            if item.id in assigned_items.values():
-                continue
-            if item.shelf_id is None or item.slot_index is None:
-                continue  # bin is in transit (carried); skip
+        # fetch missions: assign remaining free AGVs to requested shelves, if there are spots on the pickerwall
+        if effective_open > 0:
+            for item in request_queue:
+                if item.id in assigned_items.values():
+                    continue
+                if item.shelf_id is None or item.slot_index is None:
+                    continue  # bin is in transit (carried); skip
 
-            available_agvs = [a for a in agvs if not a.busy and not a.carrying_bin
-                               and a not in assigned_agvs]
-            if not available_agvs:
-                continue
+                available_agvs = _available_agvs()
+                if not available_agvs:
+                    continue
 
-            agv_paths = [env.find_agv_path((a.y, a.x), (item.y, item.x), care_for_agents=False)
-                         for a in available_agvs]
-            agv_dists = [len(p) if p else float('inf') for p in agv_paths]
-            if all(d == float('inf') for d in agv_dists):
-                continue  # no AGV can reach this item; try next
-            closest_agv = available_agvs[np.argmin(agv_dists)]
-            item_location_id = env.slot_to_action_id.get((item.shelf_id, item.slot_index))
-            if item_location_id is None:
-                continue
-            assigned_agvs[closest_agv] = Mission(MissionType.PICKING, item_location_id,
-                                                  item.x, item.y, timestep)
-            assigned_items[closest_agv] = item.id
+                agv_paths = [env.find_agv_path((a.y, a.x), (item.y, item.x), care_for_agents=False)
+                            for a in available_agvs]
+                agv_dists = [len(p) if p else float('inf') for p in agv_paths]
+                if all(d == float('inf') for d in agv_dists):
+                    continue  # no AGV can reach this item; try next
+                closest_agv = available_agvs[np.argmin(agv_dists)]
+                item_location_id = env.slot_to_action_id.get((item.shelf_id, item.slot_index))
+                if item_location_id is None:
+                    continue
+                _claim_agv(closest_agv)
+                assigned_agvs[closest_agv] = Mission(MissionType.PICKING, item_location_id,
+                                                    item.x, item.y, timestep)
+                assigned_items[closest_agv] = item.id
+
+        # idle dispatch: any AGV with no mission parks in the nearest unreserved
+        # idle-zone cell so it doesn't block highways / pickerwall entries. The
+        # IDLE mission stays alive across ticks and is preempted above when
+        # fetch or displacement needs this AGV.
+        if idle_zone_action_ids:
+            reserved_idle_ids = {
+                m.location_id for m in assigned_agvs.values()
+                if m.mission_type == MissionType.IDLE
+            }
+            for agv in agvs:
+                if agv in assigned_agvs or agv.busy or agv.carrying_bin:
+                    continue
+                candidate_ids = [aid for aid in idle_zone_action_ids if aid not in reserved_idle_ids]
+                if not candidate_ids:
+                    break
+                candidate_xy = [idle_action_id_to_xy[aid] for aid in candidate_ids]
+                paths = [env.find_agv_path((agv.y, agv.x), (y, x), care_for_agents=False)
+                         for (x, y) in candidate_xy]
+                dists = [len(p) if p else float('inf') for p in paths]
+                if all(d == float('inf') for d in dists):
+                    continue  # no reachable idle cell for this AGV this tick
+                best_idx = int(np.argmin(dists))
+                idle_id = candidate_ids[best_idx]
+                idle_x, idle_y = candidate_xy[best_idx]
+                assigned_agvs[agv] = Mission(MissionType.IDLE, idle_id,
+                                             idle_x, idle_y, timestep)
+                reserved_idle_ids.add(idle_id)
 
         for agv, mission in assigned_agvs.items():
+            if mission.mission_type == MissionType.IDLE and mission.at_location:
+                # Parked in idle zone — hold position (don't re-dispatch the macro action).
+                continue
             actions[agv] = mission.location_id if not agv.busy else 0
 
         _, reward, terminated, truncated, info = env.step(list(actions.values()))

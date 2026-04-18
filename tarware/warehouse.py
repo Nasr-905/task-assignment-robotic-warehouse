@@ -41,7 +41,8 @@ _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
 # - 4: packaging
 # - 5: replenishment (AGV take-only)
 # - 6: shared highway
-_AGV_WALKABLE_TILES = {0, 6}
+# - 7: AGV idle zone (non-shared zone that AGVs can idle in)
+_AGV_WALKABLE_TILES = {0, 6, 7}
 _AGV_LOADABLE_TILES = {0}
 _PICKER_WALKABLE_TILES = {3, 4, 6}
 _PICKER_LOADABLE_TILES = {3, 4}
@@ -527,6 +528,14 @@ class Warehouse(gym.Env):
             if tile_grid[r, c] == _SHARED_HIGHWAY_TILE
         ]
 
+        # AGV idle zones (tile 7): non-shared AGV-walkable cells where AGVs can
+        # park without blocking pickers or pickerwall entries.
+        self.agv_idle_zones = np.zeros(self.grid_size, dtype=np.int32)
+        for r in range(num_rows):
+            for c in range(num_cols):
+                if tile_grid[r, c] == 7:
+                    self.agv_idle_zones[r, c] = 1
+
         # Loadable tiles: loadings and unloadings should only occur in loadable areas,
         # which is dfiferent from highways (the shared space is ignored).
         self.loadable_tiles = np.zeros(self.grid_size, dtype=np.int32)
@@ -656,6 +665,26 @@ class Warehouse(gym.Env):
         self.num_replenishment_actions = action_id - self._replenishment_action_id_base
         self.num_non_goal_actions = self.num_storage_actions + self.num_replenishment_actions
 
+        # Idle-zone cells (tile 7): one macro action per cell so AGVs can be
+        # dispatched to wait here via the normal path planner. These actions are
+        # not bin slots, so TOGGLE_LOAD on arrival is a no-op (see _execute_load),
+        # which cleanly terminates the macro action without side effects.
+        self._idle_action_id_base = action_id
+        self.idle_zone_locs: List[Tuple[int, int]] = [
+            (c, r)
+            for r in range(num_rows)
+            for c in range(num_cols)
+            if tile_grid[r, c] == 7
+        ]
+        self.idle_zone_action_ids: List[int] = []
+        self._idle_cell_to_action_id: Dict[Tuple[int, int], int] = {}
+        for (x, y) in self.idle_zone_locs:
+            self.action_id_to_coords_map[action_id] = (y, x)
+            self.idle_zone_action_ids.append(action_id)
+            self._idle_cell_to_action_id[(x, y)] = action_id
+            action_id += 1
+        self.num_idle_actions = action_id - self._idle_action_id_base
+
         # Reverse lookup: (shelf_id, slot_idx) -> action_id. Needed by the heuristic
         # to target a specific bin slot rather than collapsing by cell.
         self.slot_to_action_id: Dict[Tuple[int, int], int] = {
@@ -691,6 +720,24 @@ class Warehouse(gym.Env):
 
     def _is_highway(self, x: int, y: int) -> bool:
         return self.highways[y, x]
+
+    def cancel_agv_motion(self, agv: Agent) -> None:
+        """Abort an AGV's in-flight macro action so a new one can be dispatched.
+
+        Safe to call only when the AGV is not carrying a bin: a carried bin has
+        a reserved destination slot that would otherwise leak. Clears the path,
+        busy flag, target, and pending micro action so the next call to
+        attribute_macro_actions treats this AGV as fresh.
+        """
+        if agv.carrying_bin is not None:
+            raise ValueError(
+                f"cancel_agv_motion: AGV id={agv.id} is carrying a bin; "
+                "cancelling would leak its reserved destination slot."
+            )
+        agv.path = None
+        agv.busy = False
+        agv.target = 0
+        agv.req_action = Action.NOOP
 
     def find_agv_path(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for an AGV on the highway grid. Returns [] if no path exists."""
@@ -1668,8 +1715,32 @@ class Warehouse(gym.Env):
             for slot_idx in range(shelf.num_slots):
                 shelf.bin_slots[slot_idx] = None
 
-        agent_loc_ids = np.random.choice(len(self.agv_spawn_locs), size=self.num_agents, replace=False)
-        agent_locs = [self.agv_spawn_locs[agent_loc_ids, 0], self.agv_spawn_locs[agent_loc_ids, 1]]
+        # Spawn AGVs preferentially in idle zones (tile 7). If there aren't
+        # enough idle cells for every AGV, fill the rest from the regular
+        # highway, excluding cells already chosen as idle spawns.
+        idle_spawn_locs = np.argwhere(self.agv_idle_zones == 1)  # (row, col)
+        n_idle = min(self.num_agents, len(idle_spawn_locs))
+        n_highway = self.num_agents - n_idle
+
+        if n_idle > 0:
+            idle_pick_ids = np.random.choice(len(idle_spawn_locs), size=n_idle, replace=False)
+            idle_pick = idle_spawn_locs[idle_pick_ids]
+        else:
+            idle_pick = np.empty((0, 2), dtype=int)
+
+        if n_highway > 0:
+            idle_set = {tuple(rc) for rc in idle_pick}
+            highway_candidates = np.array(
+                [rc for rc in self.agv_spawn_locs if tuple(rc) not in idle_set],
+                dtype=int,
+            )
+            hw_pick_ids = np.random.choice(len(highway_candidates), size=n_highway, replace=False)
+            highway_pick = highway_candidates[hw_pick_ids]
+        else:
+            highway_pick = np.empty((0, 2), dtype=int)
+
+        chosen_rc = np.concatenate([idle_pick, highway_pick], axis=0) if (n_idle + n_highway) else np.empty((0, 2), dtype=int)
+        agent_locs = [chosen_rc[:, 0], chosen_rc[:, 1]]
         agent_dirs = np.random.choice([d for d in Direction], size=self.num_agents)
         self.agents = [
             Agent(x, y, dir_, agent_type=agent_type)
