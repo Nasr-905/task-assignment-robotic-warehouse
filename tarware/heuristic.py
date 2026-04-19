@@ -200,6 +200,7 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
             if bin_ is None or not bin_.fulfilled:
                 cancel_list.append(agv)
         for agv in cancel_list:
+            env.cancel_agv_motion(agv)
             assigned_agvs.pop(agv)
             assigned_items.pop(agv, None)
 
