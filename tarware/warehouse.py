@@ -986,6 +986,17 @@ class Warehouse(gym.Env):
                     target_rc = self.action_id_to_coords_map[macro_action]  # (row, col)
                     target_xy = (target_rc[1], target_rc[0])                # (col, row)
 
+                    def _already_at_interaction_position() -> bool:
+                        if target_xy in self.goals:
+                            # Goal interactions happen from designated adjacent entry cells.
+                            return (agent.x, agent.y) in self._goal_to_agv_entry.get(target_xy, [])
+                        if not self._is_highway(target_rc[1], target_rc[0]):
+                            # Non-highway targets (storage/replenishment slots) are serviced
+                            # from an adjacent highway tile.
+                            return abs(agent.x - target_xy[0]) + abs(agent.y - target_xy[1]) <= 1
+                        # Highway/idle targets are serviced on-cell.
+                        return (agent.y, agent.x) == target_rc
+
                     if target_xy in self.goals:
                         # Pickerwall target (pick-up or drop-off): approach from adjacent
                         # highway cell so the AGV never enters the tile-2 slot.
@@ -1027,6 +1038,14 @@ class Warehouse(gym.Env):
                             if not can_move:
                                 agent.req_action = Action.NOOP
                                 agent.speed_limited_this_step = True
+                        self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
+                    elif macro_action in self.action_id_to_slot and _already_at_interaction_position():
+                        # Path can be empty when the AGV is already correctly positioned
+                        # next to the target slot. Enter busy mode so the regular busy
+                        # branch issues TOGGLE_LOAD.
+                        agent.path = []
+                        agent.busy = True
+                        agent.target = macro_action
                         self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
             else:
                 if agent.path == []:
@@ -1075,6 +1094,23 @@ class Warehouse(gym.Env):
                         occupied = shelf is not None and shelf.bin_slots[slot_idx] is not None
                         stolen = reserver is not None and reserver != agent.carrying_bin.id
                         if occupied or stolen:
+                            shelf_type = shelf.cell_type.value if shelf is not None else "unknown"
+                            logger.info(
+                                "step=%d agv_id=%d: blocked approaching target action_id=%d "
+                                "(shelf_id=%d slot=%d type=%s occupied=%s stolen=%s) "
+                                "carrying_bin_id=%d sku=%s depleted=%s",
+                                self._cur_steps,
+                                agent.id,
+                                agent.target,
+                                shelf_id,
+                                slot_idx,
+                                shelf_type,
+                                occupied,
+                                stolen,
+                                agent.carrying_bin.id,
+                                agent.carrying_bin.sku,
+                                agent.carrying_bin.depleted,
+                            )
                             agent.req_action = Action.NOOP
                             agent.busy = False
         return agvs_distance_travelled
