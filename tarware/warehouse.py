@@ -384,6 +384,7 @@ class Warehouse(gym.Env):
         self._picker_hf_episode_delay_steps = 0
         self._picker_hf_episode_failed_pick_delays = 0
         self._latest_picker_diagnostics: List[Dict[str, Any]] = []
+        self._replenishment_request_step_by_bin: Dict[int, int] = {}
         self._configure_motion_model()
 
     def steps_to_simulated_seconds(self, steps: int) -> float:
@@ -1450,10 +1451,7 @@ class Warehouse(gym.Env):
         agent.carrying_bin = None
         agent.busy = False
         agent.has_delivered = False
-        logger.info(
-            "step=%d: depleted bin_id=%d sku=%s refilled at replenishment shelf_id=%d slot=%d",
-            self._cur_steps, bin_.id, bin_.sku, shelf.id, slot_idx,
-        )
+        self._log_replenishment_filled(bin_, shelf, slot_idx)
         return rewards
 
     def _execute_unload(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
@@ -1689,6 +1687,125 @@ class Warehouse(gym.Env):
         for k in keys:
             del self._reserved_slots[k]
 
+    def _requeue_sku_request(self, sku_entry: SKUEntry, order: Order) -> None:
+        if self.order_sequencer is None:
+            return
+        self.order_sequencer._pending_sku_requests.appendleft(
+            (
+                SKUEntry(
+                    sku=sku_entry.sku,
+                    quantity=sku_entry.quantity,
+                    unit_cube=sku_entry.unit_cube,
+                ),
+                order,
+            )
+        )
+
+    def _drain_stale_pickerwall_work_for_bin(self, bin_: LogicalBin) -> None:
+        """Requeue all unpicked work still tied to a depleted pickerwall bin."""
+        removed_pending_entries = 0
+        removed_task_claims = 0
+        requeued_units = 0
+
+        kept_pending = deque()
+        while self._pickerwall_pending:
+            entry_bin_id, sku_entry, order = self._pickerwall_pending.popleft()
+            if entry_bin_id != bin_.id:
+                kept_pending.append((entry_bin_id, sku_entry, order))
+                continue
+            removed_pending_entries += 1
+            if sku_entry.quantity > 0:
+                self._requeue_sku_request(sku_entry, order)
+                requeued_units += int(sku_entry.quantity)
+        self._pickerwall_pending = kept_pending
+
+        for picker in self.pickers:
+            task = picker.task
+            if task is None:
+                continue
+            for claim in task.claims:
+                if claim.picked or claim.bin_id != bin_.id:
+                    continue
+                removed_task_claims += 1
+                if claim.sku_entry.quantity > 0:
+                    self._requeue_sku_request(claim.sku_entry, claim.order)
+                    requeued_units += int(claim.sku_entry.quantity)
+                claim.sku_entry = SKUEntry(
+                    sku=claim.sku_entry.sku,
+                    quantity=0,
+                    unit_cube=claim.sku_entry.unit_cube,
+                )
+                claim.picked = True
+
+        if removed_pending_entries or removed_task_claims:
+            logger.info(
+                "step=%d: bin_id=%d sku=%s drained stale pickerwall work "
+                "(pending_entries=%d task_claims=%d requeued_units=%d)",
+                self._cur_steps,
+                bin_.id,
+                bin_.sku,
+                removed_pending_entries,
+                removed_task_claims,
+                requeued_units,
+            )
+
+    def _pending_units_for_sku(self, sku: Optional[int]) -> int:
+        if self.order_sequencer is None or sku is None:
+            return 0
+        return sum(
+            sku_entry.quantity
+            for sku_entry, _ in self.order_sequencer._pending_sku_requests
+            if sku_entry.sku == sku
+        )
+
+    def _log_replenishment_requested(self, bin_: LogicalBin, trigger: str) -> None:
+        """Log one replenishment-request event per depleted-bin cycle."""
+        if bin_.id in self._replenishment_request_step_by_bin:
+            return
+        self._replenishment_request_step_by_bin[bin_.id] = self._cur_steps
+        logger.info(
+            "step=%d replenishment_requested: sku=%s bin_id=%d trigger=%s qty=%d pending_units_for_sku=%d",
+            self._cur_steps,
+            bin_.sku,
+            bin_.id,
+            trigger,
+            bin_.quantity,
+            self._pending_units_for_sku(bin_.sku),
+        )
+
+    def _log_replenishment_filled(
+        self,
+        bin_: LogicalBin,
+        shelf: "Shelf",
+        slot_idx: int,
+    ) -> None:
+        """Log replenishment fill completion and clear any outstanding request marker."""
+        request_step = self._replenishment_request_step_by_bin.pop(bin_.id, None)
+        if request_step is None:
+            logger.info(
+                "step=%d replenishment_filled: sku=%s bin_id=%d shelf_id=%d slot=%d qty=%d request_age_steps=unknown",
+                self._cur_steps,
+                bin_.sku,
+                bin_.id,
+                shelf.id,
+                slot_idx,
+                bin_.quantity,
+            )
+            return
+
+        age_steps = max(0, self._cur_steps - request_step)
+        logger.info(
+            "step=%d replenishment_filled: sku=%s bin_id=%d shelf_id=%d slot=%d qty=%d request_age_steps=%d request_age_sim_seconds=%.2f",
+            self._cur_steps,
+            bin_.sku,
+            bin_.id,
+            shelf.id,
+            slot_idx,
+            bin_.quantity,
+            age_steps,
+            self.steps_to_simulated_seconds(age_steps),
+        )
+
     def _decrement_bin_inventory(self, bin_: LogicalBin, quantity: int) -> int:
         """Pick ``quantity`` units from ``bin_``; return remaining stock."""
         bin_.quantity = max(0, bin_.quantity - quantity)
@@ -1699,6 +1816,9 @@ class Warehouse(gym.Env):
         if bin_.quantity <= 0:
             bin_.depleted = True
             self._remove_bin_from_sku_lookup(bin_)
+            self._drain_stale_pickerwall_work_for_bin(bin_)
+            self._maybe_mark_bin_fulfilled(bin_)
+            self._log_replenishment_requested(bin_, trigger="inventory_depleted")
         return bin_.quantity
 
     def reset(self, seed=None, options=None)-> Tuple:
@@ -1718,6 +1838,7 @@ class Warehouse(gym.Env):
         self._picker_hf_episode_delay_steps = 0
         self._picker_hf_episode_failed_pick_delays = 0
         self._latest_picker_diagnostics = []
+        self._replenishment_request_step_by_bin = {}
 
         # Clear all static shelves' slots so re-runs start empty.
         for shelf in self.shelfs:
@@ -2051,6 +2172,35 @@ class Warehouse(gym.Env):
                     self.order_sequencer._pending_sku_requests.appendleft(
                         (sku_entry, order)
                     )
+                continue
+
+            if bin_.depleted or bin_.quantity <= 0:
+                if bin_.quantity <= 0 and not bin_.depleted:
+                    # Canonicalize zero-stock bins so future assignment skips this bin
+                    # until replenishment returns it to service.
+                    bin_.depleted = True
+                    self._remove_bin_from_sku_lookup(bin_)
+                self._log_replenishment_requested(bin_, trigger="pickerwall_claim_no_stock")
+                logger.info(
+                    "step=%d _claim: bin_id=%d sku=%d has no stock - "
+                    "returning order=%s qty=%d to pending_sku_requests",
+                    self._cur_steps, bin_id, sku_entry.sku,
+                    order.order_number, sku_entry.quantity,
+                )
+                if self.order_sequencer is not None:
+                    self.order_sequencer._pending_sku_requests.appendleft(
+                        (
+                            SKUEntry(
+                                sku=sku_entry.sku,
+                                quantity=sku_entry.quantity,
+                                unit_cube=sku_entry.unit_cube,
+                            ),
+                            order,
+                        )
+                    )
+                # We just removed one stale pickerwall claim for this bin; re-check
+                # displacement eligibility so depleted bins can be evacuated.
+                self._maybe_mark_bin_fulfilled(bin_)
                 continue
 
             if zone_id is None or self._bin_pickerwall_zone(bin_id) == zone_id:

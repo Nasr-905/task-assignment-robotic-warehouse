@@ -80,6 +80,25 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 return aid
         return None
 
+    def _pickerwall_action_for_depleted_fulfilled_bin(goal_xy, reserved_ids=()):
+        """Return action_id for a depleted+fulfilled pickerwall bin slot.
+
+        Depleted bins are starvation-critical and should be displaced back to
+        replenishment even when pickerwall occupancy is below the generic
+        displacement threshold.
+        """
+        shelf = env.shelves_by_xy.get(goal_xy)
+        if shelf is None:
+            return None
+        reserved = set(reserved_ids)
+        for slot_idx, bin_ in enumerate(shelf.bin_slots):
+            if bin_ is None or not bin_.fulfilled or not bin_.depleted:
+                continue
+            aid = env.slot_to_action_id.get((shelf.id, slot_idx))
+            if aid is not None and aid not in reserved:
+                return aid
+        return None
+
     assigned_agvs: dict[Agent, Mission] = OrderedDict({})
     assigned_items: dict[Agent, int] = OrderedDict({})  # AGV -> shelf_id being fetched
     global_episode_return = 0
@@ -221,6 +240,10 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
             goal_xy for goal_xy in goal_locations
             if _pickerwall_action_for_fulfilled_bin(goal_xy, displacement_reserved_ids) is not None
         ]
+        depleted_displaceable_goals = [
+            goal_xy for goal_xy in goal_locations
+            if _pickerwall_action_for_depleted_fulfilled_bin(goal_xy, displacement_reserved_ids) is not None
+        ]
 
         effective_occupied = occupied_count - len(displacement_reserved_ids)
         effective_open = total_slots - effective_occupied
@@ -249,8 +272,39 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 and (not a.busy or _is_idle_preemptable(a))
             ]
 
+        free_agvs = _available_agvs()
+
+        # Always displace depleted bins first so replenishment can occur even
+        # when overall pickerwall occupancy is below the generic threshold.
+        for goal_xy in depleted_displaceable_goals:
+            if not free_agvs:
+                break
+            goal_id = _pickerwall_action_for_depleted_fulfilled_bin(goal_xy, displacement_reserved_ids)
+            if goal_id is None:
+                continue
+            agv_paths = [
+                env.find_agv_path_to_goal_entry((a.y, a.x), goal_xy, care_for_agents=False)
+                for a in free_agvs
+            ]
+            agv_dists = [len(p) if p else float('inf') for p in agv_paths]
+            if all(d == float('inf') for d in agv_dists):
+                continue
+            chosen = free_agvs[np.argmin(agv_dists)]
+            _claim_agv(chosen)
+            assigned_agvs[chosen] = Mission(
+                MissionType.PICKING,
+                goal_id,
+                goal_xy[0],
+                goal_xy[1],
+                timestep,
+            )
+            displacement_reserved_ids.add(goal_id)
+            effective_occupied -= 1
+            free_agvs.remove(chosen)
+
         if displaceable_goals and total_slots and effective_occupied / total_slots >= DISPLACEMENT_THRESHOLD:
-            free_agvs = _available_agvs()
+            if not free_agvs:
+                free_agvs = _available_agvs()
             for goal_xy in displaceable_goals:
                 if not free_agvs:
                     break
@@ -275,7 +329,22 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
 
         # fetch missions: assign remaining free AGVs to requested shelves, if there are spots on the pickerwall
         if effective_open > 0:
-            for item in request_queue:
+            pending_units_by_sku = {}
+            if getattr(env, "order_sequencer", None) is not None:
+                for sku_entry, _ in env.order_sequencer._pending_sku_requests:
+                    pending_units_by_sku[sku_entry.sku] = (
+                        pending_units_by_sku.get(sku_entry.sku, 0) + sku_entry.quantity
+                    )
+
+            def _request_queue_priority(item):
+                sku_backlog = pending_units_by_sku.get(getattr(item, "sku", None), 0)
+                shelf = env.shelves_by_id.get(item.shelf_id) if item.shelf_id is not None else None
+                on_replenishment = int(
+                    shelf is not None and getattr(shelf.cell_type, "value", None) == "replenishment"
+                )
+                return (-sku_backlog, -on_replenishment, item.id)
+
+            for item in sorted(request_queue, key=_request_queue_priority):
                 if item.id in assigned_items.values():
                     continue
                 if item.shelf_id is None or item.slot_index is None:
@@ -345,5 +414,5 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
             if render_sleep:
                 time.sleep(render_sleep)
         timestep += 1
-
+    
     return all_infos, global_episode_return, episode_returns
