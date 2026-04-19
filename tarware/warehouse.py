@@ -1415,6 +1415,7 @@ class Warehouse(gym.Env):
             agent.busy = False
             return rewards
         shelf.place_bin(bin_, slot_idx)
+        bin_.fulfilled = False
         self._release_reserved_slot_for_bin(bin_)
         self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
         agent.carrying_bin = None
@@ -1878,7 +1879,7 @@ class Warehouse(gym.Env):
                     del self.order_sequencer._pending_sku_requests[i]
                     return bin_, sku_entry, order, "pickerwall"
 
-                if (shelf.cell_type == BinCellType.STORAGE
+                if (shelf.cell_type in (BinCellType.STORAGE, BinCellType.REPLENISHMENT)
                         and bin_.id not in queued_ids):
                     del self.order_sequencer._pending_sku_requests[i]
                     return bin_, sku_entry, order, "storage"
@@ -2123,10 +2124,15 @@ class Warehouse(gym.Env):
         for claim in claims:
             if claim.order_number not in self._packaging_slots:
                 total_qty = sum(se.quantity for se in claim.order.skus)
+                required_per_sku: Dict[int, int] = {}
+                for se in claim.order.skus:
+                    required_per_sku[se.sku] = required_per_sku.get(se.sku, 0) + se.quantity
                 self._packaging_slots[claim.order_number] = {
                     "required": total_qty,
                     "delivered": 0,
                     "station": None,
+                    "required_per_sku": required_per_sku,
+                    "delivered_per_sku": {},
                 }
         return claims
 
@@ -2816,6 +2822,10 @@ class Warehouse(gym.Env):
                     if slot is None:
                         continue  # order already completed by a previous deposit
                     slot["delivered"] += claim.sku_entry.quantity
+                    per_sku = slot.setdefault("delivered_per_sku", {})
+                    per_sku[claim.sku_entry.sku] = (
+                        per_sku.get(claim.sku_entry.sku, 0) + claim.sku_entry.quantity
+                    )
                     if slot["delivered"] >= slot["required"]:
                         logger.info(
                             "step=%d: order=%s COMPLETE at packaging station",

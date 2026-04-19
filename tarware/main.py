@@ -209,6 +209,9 @@ def run_classical_eval(args) -> None:
                 env.unwrapped,
                 render=args.render,
                 seed=episode_seed,
+                render_sleep=args.render_sleep,
+                render_start=args.render_start,
+                render_skip=args.render_skip,
             )
             total_deliveries = sum(info.get("shelf_deliveries", 0) for info in infos)
             total_clashes = sum(info.get("clashes", 0) for info in infos)
@@ -338,6 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     classical_eval.add_argument("--episodes", type=int, default=1, help="Number of evaluation episodes.")
     classical_eval.add_argument("--render", action="store_true", help="Render while evaluating.")
+    classical_eval.add_argument("--render-sleep", type=float, default=env_float("TARWARE_RENDER_SLEEP", 0.0), help="Sleep time between renders (seconds).")
+    classical_eval.add_argument("--render-start", type=int, default=env_int("TARWARE_RENDER_START", 0), help="Timestep to start rendering.")
+    classical_eval.add_argument("--render-skip", type=int, default=env_int("TARWARE_RENDER_SKIP", 0), help="Number of timesteps to skip between renders.")
     classical_eval.set_defaults(func=run_classical_eval)
 
     rl_parser = subparsers.add_parser("rl", help="RL workflows.")
@@ -364,7 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     rl_eval.add_argument("--max-steps", type=int, default=env_int("TARWARE_STEPS", 500))
     rl_eval.add_argument("--deterministic", action="store_true")
     rl_eval.add_argument("--render", action="store_true")
-    rl_eval.add_argument("--render-sleep", type=float, default=env_float("TARWARE_RENDER_SLEEP", 0.05))
+    rl_eval.add_argument("--render-sleep", type=float, default=env_float("TARWARE_RENDER_SLEEP", 0.0), help="Sleep time between renders (seconds).")
+    rl_eval.add_argument("--render-start", type=int, default=env_int("TARWARE_RENDER_START", 0), help="Timestep to start rendering.")
+    rl_eval.add_argument("--render-skip", type=int, default=env_int("TARWARE_RENDER_SKIP", 0), help="Number of timesteps to skip between renders.")
     rl_eval.add_argument("--reward-aggregation", choices=["sum", "mean"], default="sum")
     rl_eval.set_defaults(func=run_rl_eval)
 

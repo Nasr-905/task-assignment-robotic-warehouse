@@ -488,14 +488,11 @@ class Viewer(object):
 
             any_requested = any(b.id in request_queue_ids for b in bins)
             any_depleted = any(b.depleted for b in bins)
-            any_fresh = any(b.from_replenishment for b in bins)
 
             if any_requested:
                 shelf_color = _SHELF_REQ_COLOR
             elif any_depleted:
                 shelf_color = _DEPLETED_SHELF_COLOR
-            elif shelf.cell_type == BinCellType.REPLENISHMENT or any_fresh:
-                shelf_color = _REPLENISHMENT_SHELF_COLOR
             else:
                 shelf_color = _SHELF_COLOR
 
