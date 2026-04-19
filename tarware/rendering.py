@@ -658,19 +658,22 @@ class Viewer(object):
         if not hasattr(env, "packaging_locations"):
             return
 
-        partial_slots_by_station = {}
+        # Collect every in-progress order and group by its assigned station.
+        # Stable order-number sort so stripe ordering is deterministic.
+        orders_by_station: dict = {}
         if hasattr(env, "_packaging_slots"):
-            partial_slots = sorted(
+            in_progress = sorted(
                 (
-                    (order_num, s["delivered"], s["required"], s.get("station"))
+                    (order_num, s["delivered"], s["required"], tuple(s["station"]))
                     for order_num, s in env._packaging_slots.items()
                     if s["required"] > 0 and s.get("station") is not None
                 ),
                 key=lambda t: t[0],
             )
-            for order_info in partial_slots:
-                station = tuple(order_info[3])
-                partial_slots_by_station.setdefault(station, order_info)
+            for order_num, delivered, required, station in in_progress:
+                orders_by_station.setdefault(station, []).append(
+                    (order_num, delivered, required)
+                )
 
         gs = self.grid_size + 1
         pad = _SHELF_PADDING
@@ -683,10 +686,9 @@ class Viewer(object):
             y0 = gs * y + pad + 1
             y1 = gs * (y + 1) - pad
 
-            # Each square displays progress only for an order assigned to this station.
-            order_info = partial_slots_by_station.get((px, py))
+            orders = orders_by_station.get((px, py), [])
 
-            base_color = _PACKAGING_PARTIAL_COLOR if order_info else _PACKAGING_COLOR
+            base_color = _PACKAGING_PARTIAL_COLOR if orders else _PACKAGING_COLOR
             base_batch = pyglet.graphics.Batch()
             base_batch.add(
                 4, gl.GL_QUADS, None,
@@ -695,28 +697,36 @@ class Viewer(object):
             )
             base_batch.draw()
 
-            if order_info:
-                _order_num, delivered, required, _station = order_info
-                fill_ratio = delivered / required if required > 0 else 0.0
-
-                if fill_ratio > 0:
-                    # Vertical progress bar filling from the bottom up
-                    fill_y1 = y0 + (y1 - y0) * fill_ratio
-                    fill_batch = pyglet.graphics.Batch()
+            if orders:
+                # One vertical progress stripe per order, laid out side-by-side
+                # across the square's width.
+                n = len(orders)
+                total_width = x1 - x0
+                stripe_w = total_width / n
+                stripe_pad = 0.5 if stripe_w > 2 else 0.0  # thin gap between stripes
+                height = y1 - y0
+                fill_batch = pyglet.graphics.Batch()
+                for i, (_order_num, delivered, required) in enumerate(orders):
+                    sx0 = x0 + i * stripe_w + stripe_pad
+                    sx1 = x0 + (i + 1) * stripe_w - stripe_pad
+                    fill_ratio = min(1.0, delivered / required) if required > 0 else 0.0
+                    if fill_ratio <= 0:
+                        continue
+                    sy1 = y0 + height * fill_ratio
                     fill_batch.add(
                         4, gl.GL_QUADS, None,
-                        ("v2f", (x0, y0, x1, y0, x1, fill_y1, x0, fill_y1)),
+                        ("v2f", (sx0, y0, sx1, y0, sx1, sy1, sx0, sy1)),
                         ("c3B", 4 * _PACKAGING_FILL_COLOR),
                     )
-                    fill_batch.draw()
+                fill_batch.draw()
 
-                # Label: "delivered/required" centred in the square
+                # Label: number of orders being fulfilled at this station.
                 cx = (x0 + x1) // 2
                 cy = (y0 + y1) // 2
                 pyglet.text.Label(
-                    f"{delivered}/{required}",
+                    str(n),
                     font_name="Arial",
-                    font_size=6,
+                    font_size=7,
                     bold=True,
                     x=cx, y=cy,
                     anchor_x="center", anchor_y="center",
