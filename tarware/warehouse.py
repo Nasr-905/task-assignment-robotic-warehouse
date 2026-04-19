@@ -2398,9 +2398,69 @@ class Warehouse(gym.Env):
                 key=lambda loc: abs(loc[0] - picker.x) + abs(loc[1] - picker.y),
             )
 
+        occupied_by_other_picker = {
+            (p.x, p.y) for p in self.pickers if p is not picker
+        }
+        free_candidates = [
+            c for c in packaging_candidates if c not in occupied_by_other_picker
+        ]
+        if free_candidates:
+            packaging_candidates = free_candidates
+
         return min(
             packaging_candidates,
             key=lambda loc: abs(loc[0] - picker.x) + abs(loc[1] - picker.y),
+        )
+
+    def _start_idle_relocation(self, picker: "Picker") -> None:
+        """Route an idle picker off an active packaging station so others can deposit there."""
+        current_xy = (picker.x, picker.y)
+        packaging_set = set(self.packaging_locations)
+        if current_xy not in packaging_set:
+            picker.path = []
+            return
+
+        occupied = {
+            tuple(slot["station"])
+            for slot in self._packaging_slots.values()
+            if slot.get("station") is not None
+        }
+        if current_xy not in occupied:
+            picker.path = []
+            return
+
+        occupied_by_other_picker = {
+            (p.x, p.y) for p in self.pickers if p is not picker
+        }
+        zone_packaging = self._packaging_locations_for_picker(picker)
+        free_stations = [
+            loc for loc in zone_packaging
+            if loc not in occupied and loc not in occupied_by_other_picker
+        ]
+        if free_stations:
+            target = min(
+                free_stations,
+                key=lambda loc: abs(loc[0] - picker.x) + abs(loc[1] - picker.y),
+            )
+        elif len(self.picker_spawn_locs) > 0:
+            best = None
+            best_d = None
+            for (r, c) in self.picker_spawn_locs:
+                d = abs(int(c) - picker.x) + abs(int(r) - picker.y)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = (int(c), int(r))
+            target = best
+        else:
+            picker.path = []
+            return
+
+        picker.path = self.find_picker_path(
+            (picker.y, picker.x), (target[1], target[0]), care_for_agents=True
+        )
+        logger.debug(
+            "step=%d picker_id=%d: idle relocation target=(col=%d row=%d) path_len=%d",
+            self._cur_steps, picker.id, target[0], target[1], len(picker.path),
         )
 
     def _start_walk_to_packaging(self, picker: "Picker") -> None:
@@ -2863,16 +2923,33 @@ class Warehouse(gym.Env):
             if picker.state == PickerState.IDLE:
                 picker.stalled = False
                 claims = self._claim_items_for_picker(picker)
-                if not claims:
+                if claims:
+                    picker.task = self._build_picker_task(picker, claims)
+                    logger.info(
+                        "step=%d picker_id=%d: claimed %d item(s) across %d order(s)",
+                        self._cur_steps, picker.id,
+                        sum(c.sku_entry.quantity for c in claims),
+                        len({c.order_number for c in claims}),
+                    )
+                    self._picker_walk_to_next_shelf(picker)
                     continue
-                picker.task = self._build_picker_task(picker, claims)
-                logger.info(
-                    "step=%d picker_id=%d: claimed %d item(s) across %d order(s)",
-                    self._cur_steps, picker.id,
-                    sum(c.sku_entry.quantity for c in claims),
-                    len({c.order_number for c in claims}),
-                )
-                self._picker_walk_to_next_shelf(picker)
+                if not picker.path:
+                    self._start_idle_relocation(picker)
+                if picker.path:
+                    if not self._consume_motion_credit(picker, self._picker_cells_per_step_effective):
+                        picker.speed_limited_this_step = True
+                        continue
+                    if self._picker_movement_delay_this_step(picker, hf_state, hf_profile):
+                        continue
+                    next_xy = picker.path[0]
+                    if self._picker_next_cell_blocked(picker, next_xy):
+                        picker.blocked_ticks += 1
+                        continue
+                    picker.x, picker.y = next_xy[0], next_xy[1]
+                    picker.path = picker.path[1:]
+                    picker.blocked_ticks = 0
+                    if self.human_factors_config.enabled and hf_state is not None and hf_profile is not None:
+                        self._apply_picker_effort(hf_state, hf_profile, hf_profile.metabolic_rate_walking)
 
             # WAITING_FOR_SHELF
             elif picker.state == PickerState.WAITING_FOR_SHELF:
@@ -3025,6 +3102,7 @@ class Warehouse(gym.Env):
                 picker.packaging_location = None
                 picker.task = None
                 picker.state = PickerState.IDLE
+                self._start_idle_relocation(picker)
 
     def step(
         self, macro_actions: List[int]
