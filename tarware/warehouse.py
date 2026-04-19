@@ -584,8 +584,16 @@ class Warehouse(gym.Env):
             if tile_grid[r, c] == 5
         ]
         self._replenishment_locs_set: set = set(self.replenishment_locs)
+        
+        # Off-limit cells: blank tiles where no agents can go
+        self.off_limit_locs: List[Tuple[int, int]] = [
+            (c, r)
+            for r in range(num_rows)
+            for c in range(num_cols)
+            if tile_grid[r, c] == 9
+        ]
+        
         self._make_shelves()
-
         self.agv_spawn_locs = np.argwhere(self.highways == 1)  # (row, col)
 
         # Picker spawn cells exclude packaging stations. Picker aisles may be

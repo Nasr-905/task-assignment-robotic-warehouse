@@ -74,12 +74,14 @@ _SHELF_REQ_COLOR = _TEAL
 _AGENT_COLOR = _DARKORANGE
 _AGENT_LOADED_COLOR = _RED
 _AGENT_DIR_COLOR = _BLACK
-_GOAL_COLOR = (60, 60, 60)
+_GOAL_COLOR = (100, 100, 100)
 _SHELF_FULFILLED_COLOR = (0, 160, 80)   # green: pickerwall shelf fully picked, ready to displace
 _CARRIER_COLOR = _MAROON
 _LOADER_AGENT = _BLUE
 
-_SHELF_LOC_COLOR = (200, 200, 200)    # light gray for shelf location markers
+_OFF_LIMIT_COLOR = (30, 30, 30)        # pure black for off-limits areas
+_AGV_IDLE_COLOR = (210, 210, 210)       # super light grey for idle AGVs
+_SHELF_LOC_COLOR = (150, 150, 150)    # light gray for shelf location markers
 _PICKER_ZONE_COLOR = (170, 230, 255)   # light blue background for picker zone
 _SHARED_HIGHWAY_COLOR = (205, 235, 205)  # green-blue tint: shared AGV/picker aisle
 _REPLENISHMENT_ZONE_COLOR = (220, 255, 220)  # light green background for replenishment zone
@@ -336,6 +338,8 @@ class Viewer(object):
 
         self._draw_grid()
         self._draw_shelf_locs(env)
+        self._draw_agv_idle_zone(env)
+        self._draw_off_limits(env)
         self._draw_picker_zone(env)
         self._draw_shared_highways(env)
         self._draw_replenishment_zone(env)
@@ -397,6 +401,26 @@ class Viewer(object):
             )
         batch.draw()
 
+    def _draw_off_limits(self, env):
+        if not hasattr(env, "off_limit_locs") or not env.off_limit_locs:
+            return
+        batch = pyglet.graphics.Batch()
+        gs = self.grid_size + 1
+        for col, row in env.off_limit_locs:
+            y = self.rows - row - 1
+            batch.add(
+                4, gl.GL_QUADS, None,
+                ("v2f", (
+                    gs * col + 1,        gs * y + 1,
+                    gs * (col + 1),      gs * y + 1,
+                    gs * (col + 1),      gs * (y + 1),
+                    gs * col + 1,        gs * (y + 1),
+                )),
+                ("c3B", 4 * _OFF_LIMIT_COLOR),
+            )
+        batch.draw()
+
+
     def _draw_shelf_locs(self, env):
         if not hasattr(env, "shelf_locs") or not env.shelf_locs:
             return
@@ -414,6 +438,28 @@ class Viewer(object):
                 )),
                 ("c3B", 4 * _SHELF_LOC_COLOR),
             )
+        batch.draw()
+
+    def _draw_agv_idle_zone(self, env):
+        if not hasattr(env, "agv_idle_zones") or not env.agv_idle_zones.any():
+            return
+        batch = pyglet.graphics.Batch()
+        gs = self.grid_size + 1
+        for row in range(env.grid_size[0]):
+            y = self.rows - row - 1  # pyglet reversed
+            for col in range(env.grid_size[1]):
+                if env.agv_idle_zones[row, col] != 1:
+                    continue
+                batch.add(
+                    4, gl.GL_QUADS, None,
+                    ("v2f", (
+                        gs * col + 1,        gs * y + 1,
+                        gs * (col + 1),      gs * y + 1,
+                        gs * (col + 1),      gs * (y + 1),
+                        gs * col + 1,        gs * (y + 1),
+                    )),
+                    ("c3B", 4 * _AGV_IDLE_COLOR),
+                )
         batch.draw()
 
     def _draw_shelfs(self, env):
