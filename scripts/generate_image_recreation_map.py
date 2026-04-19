@@ -28,13 +28,17 @@ import os
 # CONFIGURATION — edit these values
 # ============================================================
 
-SET_DEFAULT=False
+TINY=False
+SMALL=False
+MEDIUM=False
+LARGE=False
+FULL=True
 
 # File paths  (mirrors scripts/generate_orders.py)
 TARWARE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAPS_DIR    = os.path.join(TARWARE_DIR, "data", "maps")
 MAP_FORMAT_PATH = os.path.join(MAPS_DIR, "map_format.json")
-OUTPUT_NAME     = "large_dhl"   # -> image_recreation.csv / .json
+OUTPUT_NAME     = "full_dhl"   # -> {output_name}.csv / {output_name}.json
 
 # Bay-level structural parameters
 N_SECTIONS           = 2    # number of horizontal sections (Default: 4)
@@ -75,8 +79,32 @@ RIGHT_STORAGE_REPEATS        = STORAGE_REPEATS
 STORAGE_TO_REPLENISHMENT_GAP = 2    # empty cols between the rightmost storage block and the replenishment region (Default: 9)
 REPLENISHMENT_REPEATS        = 1    # number of replenishment blocks (Default: 1)
 
-# Override given configuration if SET_DEFAULT is True (for quick testing)
-if SET_DEFAULT:
+# Override given configuration if TINY is True (for tiny_dhl)
+if TINY:
+    N_SECTIONS = 1
+    SECTION_HEIGHT = 1
+    STORAGE_REPEATS = 1
+
+# Override given configuration if SMALL is True (for small_dhl)
+if SMALL:
+    N_SECTIONS = 1
+    SECTION_HEIGHT = 2
+    STORAGE_REPEATS = 2
+
+# Override given configuration if MEDIUM is True (for medium_dhl)
+if MEDIUM:
+    N_SECTIONS = 2
+    SECTION_HEIGHT = 2
+    STORAGE_REPEATS = 3
+
+# Override given configuration if LARGE is True (for large_dhl)
+if LARGE:
+    N_SECTIONS = 2
+    SECTION_HEIGHT = 4
+    STORAGE_REPEATS = 5
+
+# Override given configuration if FULL is True (for full_dhl)
+if FULL:
     N_SECTIONS = 4
     SECTION_HEIGHT = 10
     SECTION_VERTICAL_GAP = 8
@@ -97,6 +125,9 @@ if SET_DEFAULT:
     STORAGE_TO_REPLENISHMENT_GAP = 9
     REPLENISHMENT_REPEATS = 1
 
+# Ensure RIGHT_STORAGE_REPEATS matches STORAGE_REPEATS after all overrides
+RIGHT_STORAGE_REPEATS = STORAGE_REPEATS
+
 # ============================================================
 # END CONFIGURATION
 # ============================================================
@@ -110,6 +141,7 @@ AGV_AISLE_CHAR     = "3"
 PACKAGING_CHAR     = "4"
 HIGHWAY_CHAR       = "6"
 IDLE_ZONE_CHAR     = "7"
+REPLENISHMENT_MARGIN_CHAR = "9"
 EMPTY_CHAR         = "0"
 
 # Shelf-map numeric codes produced by the expansion step
@@ -118,6 +150,7 @@ CHAR_TO_NUMERIC = {
     PICKWALL_CHAR:      "2",
     REPLENISHMENT_CHAR: "5",
     IDLE_ZONE_CHAR:     "7",
+    REPLENISHMENT_MARGIN_CHAR: "9",
 }
 
 
@@ -274,6 +307,21 @@ def build_bay_map():
             col = add_storage_region(row, col, RIGHT_STORAGE_REPEATS)
             col += STORAGE_TO_REPLENISHMENT_GAP
             add_replenishment_region(row, col, REPLENISHMENT_REPEATS)
+
+    # Fill the right margin with replenishment margin marker
+    # Only fill to the right of replenishment cells in rows that have them
+    for r in range(len(grid)):
+        # Find the rightmost replenishment cell in this row
+        rightmost_rep = -1
+        for c in range(len(grid[r])):
+            if grid[r][c] == REPLENISHMENT_CHAR:
+                rightmost_rep = c
+
+        # If this row has replenishment cells, fill to the right with margin marker
+        if rightmost_rep != -1:
+            for c in range(rightmost_rep + 1, width):
+                if grid[r][c] == EMPTY_CHAR:
+                    grid[r][c] = REPLENISHMENT_MARGIN_CHAR
 
     return grid
 
