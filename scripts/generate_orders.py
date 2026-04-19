@@ -27,12 +27,12 @@ import numpy as np
 # ============================================================
 
 # Catalog & volume
-NUM_SKUS        = 1080    # unique SKUs in the catalogue
-NUM_TIME_BUCKETS = 60   # number of 60-second windows to simulate
+NUM_SKUS        = 3600    # unique SKUs in the catalogue
+NUM_TIME_BUCKETS = 180   # number of 60-second windows to simulate
 
 # Poisson rate: expected orders arriving per 60-second window.
 # Total orders ≈ POISSON_LAMBDA * NUM_TIME_BUCKETS.
-POISSON_LAMBDA  = 15.0
+POISSON_LAMBDA  = 10.0
 
 # SKU frequency distribution
 # Each SKU is ranked 1..NUM_SKUS by popularity.
