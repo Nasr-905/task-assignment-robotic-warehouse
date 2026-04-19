@@ -1,0 +1,19 @@
+Important:
+- Sim speed slows down a lot at certain steps, I think it's because there is a lot of clashing, and with our profiling, routing robots seems to take a long time.
+- Running on larger / realistic DHL data
+
+Future:
+- resolve_stuck_agents might be obselete given the current logic in resolve_move_conflict. In general, we should re-design conflict handling, as there are a lot of calls to find_agv_path, which according to the profiling results, is where our system spends ~30% of its time in.
+- We might require more complex picker zone definitions in the future, that include column and row (right now, what we are doing is assigning zones based on the rows of the zone, which would work if each row can only hold one goal cell, but this isn't necessarily the case). We might want to make a "zone center" and a manhattan distance heuristic threshold for picker membership of the zone. This is based off of the logic in _balanced_picker_spawn_specs and _build_pickerwall_zones
+- Approximate travelling salesman problem solution for a picker picking from its list of claims
+- Further optimizations on picker order selection, such as targetting single-order SKUs to bang out all at once (this can technically be built into the algorithm, as pickers do not choose their orders to fulfill anyways)
+- AGV conflict optimization - it is a little slow, steps should be taken to reduce the number of steps it takes
+- Slotting of individual SKUs
+- Reinforcement learning instead of the heuristic
+- More intelligent replenishment (e.g., calling for replenishment ahead of time)
+- More accurate implementation of packaging (this is something that was kind of opaque to us in the project, but better estimating this would allow us to develop better policies)
+- Intelligent pickerwall placement based on congestion. Right now, we don't consider congestion in any way, and still place on the pickerwall at the closest location.
+- Further optimization of the pickerwall_pending queue selection (Right now, we have 3 parameters that we use for priority: age, completion amount, and shared sku amount, where we focus entirely on SKU age. We should find a good combination of these, and make them dynamic for different warehouse environments -- i.e. reweighting the priorities if we see that old orders are sitting for too long)
+- Refactor the codebase - specifically, refactor the warehouse.py file into multiple other files.
+- Update picker inventory size so that they can hold a finite size of items, as opposed to an exact amount of items
+- Avoid clashing by computing paths with the knowledge of other paths in the warehouse, and avoid other robots by initial path planning, not in a response to their conflict.
