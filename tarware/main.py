@@ -20,6 +20,7 @@ if __name__ == "__main__":
 
 import tarware
 from tarware.heuristic import heuristic_episode
+from tarware.sim_stats import SimulationStatsTracker, format_available_fields
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +42,13 @@ def env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError as exc:
         raise ValueError(f"Environment variable {name} must be a float, got {value!r}") from exc
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def unpack_reset(reset_out):
@@ -101,6 +109,69 @@ def make_base_env(args) -> gym.Env:
 
 def get_env_and_id(args):
     return make_base_env(args), build_env_id(args.size, args.agvs, args.pickers, args.obs_type)
+
+
+def add_stats_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--stats-enable", action="store_true", default=env_bool("TARWARE_STATS_ENABLED", False))
+    parser.add_argument(
+        "--stats-dir",
+        type=str,
+        default=os.getenv("TARWARE_STATS_DIR", "stats"),
+        help="Directory for emitted simulation statistics.",
+    )
+    parser.add_argument(
+        "--stats-prefix",
+        type=str,
+        default=os.getenv("TARWARE_STATS_PREFIX"),
+        help="Optional filename prefix for stats artifacts.",
+    )
+    parser.add_argument(
+        "--stats-every",
+        type=int,
+        default=env_int("TARWARE_STATS_EVERY", 1),
+        help="Record one sample every N simulation steps.",
+    )
+    parser.add_argument(
+        "--stats-roles",
+        type=str,
+        default=os.getenv("TARWARE_STATS_ROLES", "agv,picker"),
+        help="Comma-separated roles to track: agv,picker.",
+    )
+    parser.add_argument(
+        "--stats-entity-fields",
+        type=str,
+        default=os.getenv("TARWARE_STATS_ENTITY_FIELDS", "default"),
+        help="Comma-separated entity fields, or one of: default, all, none.",
+    )
+    parser.add_argument(
+        "--stats-step-fields",
+        type=str,
+        default=os.getenv("TARWARE_STATS_STEP_FIELDS", "default"),
+        help="Comma-separated step fields, or one of: default, all, none.",
+    )
+    parser.add_argument(
+        "--stats-no-entity-csv",
+        action="store_true",
+        default=not env_bool("TARWARE_STATS_WRITE_ENTITY_CSV", True),
+        help="Disable per-entity CSV output.",
+    )
+    parser.add_argument(
+        "--stats-no-step-csv",
+        action="store_true",
+        default=not env_bool("TARWARE_STATS_WRITE_STEP_CSV", True),
+        help="Disable per-step CSV output.",
+    )
+    parser.add_argument(
+        "--stats-heatmaps",
+        action="store_true",
+        default=env_bool("TARWARE_STATS_HEATMAPS", False),
+        help="Save aggregate AGV/picker visit heatmaps as CSV and NPY files.",
+    )
+    parser.add_argument(
+        "--stats-list-fields",
+        action="store_true",
+        help="Print available stats fields and exit.",
+    )
 
 
 class JointWarehouseWrapper(gym.Wrapper):
@@ -201,10 +272,14 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
 
 def run_classical_eval(args) -> None:
     env = gym.make(tarware.ENV_ID)
+    args.stats_write_entity_csv = not args.stats_no_entity_csv
+    args.stats_write_step_csv = not args.stats_no_step_csv
+    tracker = SimulationStatsTracker.from_args(args, run_name="classical_eval", env_id=tarware.ENV_ID)
     LOGGER.info("classical_eval env_id=%s", tarware.ENV_ID)
     try:
         for episode in range(args.episodes):
             episode_seed = args.seed + episode
+            tracker.start_episode(env.unwrapped, episode + 1)
             infos, global_return, agent_returns = heuristic_episode(
                 env.unwrapped,
                 render=args.render,
@@ -212,7 +287,9 @@ def run_classical_eval(args) -> None:
                 render_sleep=args.render_sleep,
                 render_start=args.render_start,
                 render_skip=args.render_skip,
+                step_callback=tracker.record_step if tracker.enabled else None,
             )
+            tracker.finalize_episode(env.unwrapped)
             total_deliveries = sum(info.get("shelf_deliveries", 0) for info in infos)
             total_clashes = sum(info.get("clashes", 0) for info in infos)
             total_stucks = sum(info.get("stucks", 0) for info in infos)
@@ -228,6 +305,7 @@ def run_classical_eval(args) -> None:
                 np.asarray(agent_returns, dtype=np.float64).round(3).tolist(),
             )
     finally:
+        tracker.close()
         env.close()
         LOGGER.info("closed=True")
 
@@ -267,6 +345,9 @@ def run_rl_eval(args) -> None:
     PPO = sb3.PPO
     base_env, env_id = get_env_and_id(args)
     env = JointWarehouseWrapper(base_env, reward_aggregation=args.reward_aggregation)
+    args.stats_write_entity_csv = not args.stats_no_entity_csv
+    args.stats_write_step_csv = not args.stats_no_step_csv
+    tracker = SimulationStatsTracker.from_args(args, run_name="rl_eval", env_id=env_id)
     LOGGER.info("rl_eval env_id=%s", env_id)
     LOGGER.info("config agvs=%d pickers=%d size=%s obs=%s", args.agvs, args.pickers, args.size, args.obs_type)
 
@@ -278,6 +359,7 @@ def run_rl_eval(args) -> None:
     try:
         for episode in range(args.episodes):
             obs, _ = env.reset(seed=args.seed + episode)
+            tracker.start_episode(base_env.unwrapped, episode + 1)
             done = False
             truncated = False
             episode_return = 0.0
@@ -286,6 +368,14 @@ def run_rl_eval(args) -> None:
             while not (done or truncated) and steps < args.max_steps:
                 action, _ = model.predict(obs, deterministic=args.deterministic)
                 obs, reward, done, truncated, info = env.step(action)
+                tracker.record_step(
+                    base_env.unwrapped,
+                    info,
+                    macro_actions=np.asarray(action, dtype=np.int64).reshape(-1).tolist(),
+                    reward=reward,
+                    terminated=done,
+                    truncated=truncated,
+                )
                 episode_return += float(reward)
                 steps += 1
 
@@ -304,6 +394,7 @@ def run_rl_eval(args) -> None:
                 )
 
             episode_returns.append(episode_return)
+            tracker.finalize_episode(base_env.unwrapped)
             LOGGER.info(
                 "episode=%s steps=%s return=%.3f",
                 episode + 1,
@@ -314,6 +405,7 @@ def run_rl_eval(args) -> None:
         arr = np.asarray(episode_returns, dtype=np.float64)
         LOGGER.info("eval_summary episodes=%s mean_return=%.3f std_return=%.3f", len(arr), arr.mean(), arr.std())
     finally:
+        tracker.close()
         env.close()
         LOGGER.info("closed=True")
 
@@ -344,6 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     classical_eval.add_argument("--render-sleep", type=float, default=env_float("TARWARE_RENDER_SLEEP", 0.0), help="Sleep time between renders (seconds).")
     classical_eval.add_argument("--render-start", type=int, default=env_int("TARWARE_RENDER_START", 0), help="Timestep to start rendering.")
     classical_eval.add_argument("--render-skip", type=int, default=env_int("TARWARE_RENDER_SKIP", 0), help="Number of timesteps to skip between renders.")
+    add_stats_args(classical_eval)
     classical_eval.set_defaults(func=run_classical_eval)
 
     rl_parser = subparsers.add_parser("rl", help="RL workflows.")
@@ -374,6 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
     rl_eval.add_argument("--render-start", type=int, default=env_int("TARWARE_RENDER_START", 0), help="Timestep to start rendering.")
     rl_eval.add_argument("--render-skip", type=int, default=env_int("TARWARE_RENDER_SKIP", 0), help="Number of timesteps to skip between renders.")
     rl_eval.add_argument("--reward-aggregation", choices=["sum", "mean"], default="sum")
+    add_stats_args(rl_eval)
     rl_eval.set_defaults(func=run_rl_eval)
 
     return parser
@@ -382,6 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "stats_list_fields", False):
+        print(format_available_fields())
+        return
     configure_logging(args.log_level)
 
     if getattr(args, "agvs", 1) < 1:

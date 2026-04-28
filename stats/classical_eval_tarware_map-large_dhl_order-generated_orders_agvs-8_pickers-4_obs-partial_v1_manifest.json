@@ -1,0 +1,53 @@
+{
+  "run_name": "classical_eval",
+  "env_id": "tarware/map-large_dhl_order-generated_orders_agvs-8_pickers-4_obs-partial_v1",
+  "output_dir": "/Users/andrew/capstone/task-assignment-robotic-warehouse/stats",
+  "every_n_steps": 1,
+  "roles": [
+    "agv",
+    "picker"
+  ],
+  "entity_fields": [
+    "episode",
+    "step",
+    "simulated_seconds",
+    "entity_kind",
+    "entity_id",
+    "x",
+    "y",
+    "macro_action",
+    "macro_target_x",
+    "macro_target_y",
+    "req_action",
+    "path_length",
+    "busy",
+    "carrying_bin_id",
+    "carrying_sku",
+    "state"
+  ],
+  "step_fields": [
+    "episode",
+    "step",
+    "simulated_seconds",
+    "real_seconds",
+    "reward_sum",
+    "request_queue_len",
+    "order_pending_count",
+    "order_active_count",
+    "shelf_deliveries",
+    "clashes",
+    "picker_yields",
+    "stucks",
+    "agvs_distance_travelled",
+    "agvs_idle_time"
+  ],
+  "write_entity_csv": false,
+  "write_step_csv": false,
+  "write_heatmaps": true,
+  "grid_size": [
+    38,
+    61
+  ],
+  "num_agvs": 8,
+  "num_pickers": 4
+}

@@ -25,7 +25,7 @@ class Mission:
     at_location: bool = False
 
 
-def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=0, render_sleep=0.0):
+def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=0, render_sleep=0.0, step_callback=None):
     # non_goal_location_ids aligns with the index ordering of get_empty_shelf_information.
     # Idle-zone action IDs sit after replenishment in action_id_to_coords_map, so we
     # cap the iteration at _idle_action_id_base to keep the 1:1 mapping with the
@@ -402,12 +402,23 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 continue
             actions[agv] = mission.location_id if not agv.busy else 0
 
-        _, reward, terminated, truncated, info = env.step(list(actions.values()))
+        macro_actions = list(actions.values())
+        _, reward, terminated, truncated, info = env.step(macro_actions)
         done = terminated or truncated
         episode_returns += np.array(reward, dtype=np.float64)
         global_episode_return += np.sum(reward)
         done = all(done)
         all_infos.append(info)
+
+        if step_callback is not None:
+            step_callback(
+                env,
+                info,
+                macro_actions=macro_actions,
+                reward=reward,
+                terminated=terminated,
+                truncated=truncated,
+            )
 
         if render and timestep >= render_start and timestep % (render_skip + 1) == 0:
             env.render(mode="human")
