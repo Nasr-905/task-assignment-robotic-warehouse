@@ -11,31 +11,32 @@ from tarware.warehouse import RewardType
 _MAP_NAME = os.getenv("TARWARE_MAP_NAME", "medium")
 _MAP_CSV_FILENAME = f"{_MAP_NAME}.csv"
 _MAP_JSON_FILENAME = f"{_MAP_NAME}.json"
-_MAP_CSV_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "data" / "maps" / _MAP_CSV_FILENAME
-)
-_MAP_JSON_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "data" / "maps" / _MAP_JSON_FILENAME
-)
-# CSV Path of the order data to be used in the environment. Can be set via the 
-# TARWARE_ORDER_DATA environment variable, or defaults to "order_data_sample" 
+_DEFAULT_DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
+_MAP_CSV_PATH = Path(os.getenv(
+    "TARWARE_MAP_CSV_PATH",
+    str(_DEFAULT_DATA_ROOT / "maps" / _MAP_CSV_FILENAME)
+))
+_MAP_JSON_PATH = Path(os.getenv(
+    "TARWARE_MAP_JSON_PATH",
+    str(_DEFAULT_DATA_ROOT / "maps" / _MAP_JSON_FILENAME)
+))
+# CSV Path of the order data to be used in the environment. Can be set via the
+# TARWARE_ORDER_DATA environment variable, or defaults to "order_data_sample"
 # in the data/processed directory.
 _ORDER_DATA = os.getenv("TARWARE_ORDER_DATA", "order_data_sample")
 _ORDER_CSV_FILENAME = f"{_ORDER_DATA}.csv"
-_ORDER_CSV_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "data" / "processed" / _ORDER_CSV_FILENAME
-)
-# CSV Path of the ABC analysis data to be used in the environment. Can be set via the 
-# TARWARE_ABC_CSV environment variable, or defaults to "abc_data_sample.csv" in the 
+_ORDER_CSV_PATH = Path(os.getenv(
+    "TARWARE_ORDER_CSV_PATH",
+    str(_DEFAULT_DATA_ROOT / "processed" / _ORDER_CSV_FILENAME)
+))
+# CSV Path of the ABC analysis data to be used in the environment. Can be set via the
+# TARWARE_ABC_CSV environment variable, or defaults to "abc_data_sample.csv" in the
 # data/processed directory.
 _ABC_CSV_FILENAME = os.getenv("TARWARE_ABC_CSV", "abc_data_sample.csv")
-_ABC_CSV_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "data" / "processed" / _ABC_CSV_FILENAME
-)
+_ABC_CSV_PATH = Path(os.getenv(
+    "TARWARE_ABC_CSV_PATH",
+    str(_DEFAULT_DATA_ROOT / "processed" / _ABC_CSV_FILENAME)
+))
 
 # Number of AGVs (defaults to 3)
 _NUM_AGVS = int(os.getenv("TARWARE_AGVS", 3))

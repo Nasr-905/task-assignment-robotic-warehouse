@@ -331,6 +331,9 @@ class Warehouse(gym.Env):
         self._cur_inactive_steps = None
         self._cur_steps = 0
         self.max_steps = max_steps
+        # Per-step picker output: sum of unit quantities picked across all
+        # pickers this step. Reset to 0 at the start of each step in step().
+        self._step_items_picked: int = 0
         self.picker_policy = os.getenv("TARWARE_PICKER_POLICY", "fifo").lower()
         self.picker_zone_overflow = os.getenv("TARWARE_PICKER_ZONE_OVERFLOW", "adjacent").lower()
         self.picker_stall_probability = float(os.getenv("TARWARE_PICKER_STALL_PROBABILITY", "0.0"))
@@ -3019,6 +3022,7 @@ class Warehouse(gym.Env):
                     for claim in picker.task.claims:
                         if not claim.picked and claim.bin_id == current_bin_id:
                             claim.picked = True
+                            self._step_items_picked += claim.sku_entry.quantity
                             if bin_ is not None:
                                 remaining_stock = self._decrement_bin_inventory(
                                     bin_,
@@ -3133,6 +3137,7 @@ class Warehouse(gym.Env):
         rewards = np.zeros(self.num_agents)
         rewards -= 0.001
         self._step_deliveries = 0
+        self._step_items_picked = 0
         rewards = self.execute_micro_actions(rewards)
         self._advance_pickers()
         rewards, shelf_deliveries = self.process_shelf_deliveries(rewards)
@@ -3173,6 +3178,7 @@ class Warehouse(gym.Env):
         agvs_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents])
         info["vehicles_busy"] = [agent.busy for agent in self.agents]
         info["shelf_deliveries"] = shelf_deliveries
+        info["items_picked"] = self._step_items_picked
         info["clashes"] = clashes_count
         info["picker_yields"] = picker_yields_count
         info["stucks"] = stucks_count
