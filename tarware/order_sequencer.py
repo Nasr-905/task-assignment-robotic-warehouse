@@ -4,6 +4,7 @@ import collections
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Set
 
@@ -39,10 +40,15 @@ class Order:
     order_type: str
     skus: List[SKUEntry] = field(default_factory=list)
     priority: int = 0           # reserved for future priority queue support
+    # Absolute release time in simulated seconds, measured from the
+    # sequencer epoch (midnight of the earliest date_created seen).
+    # Set by OrderSequencer after loading; needed so the time gate keeps
+    # working across day boundaries.
+    release_seconds: int = 0
 
     def __lt__(self, other: "Order") -> bool:
-        return (self.priority, self.date_created, self.time_created_seconds) < (
-            other.priority, other.date_created, other.time_created_seconds
+        return (self.priority, self.release_seconds) < (
+            other.priority, other.release_seconds
         )
 
 
@@ -87,6 +93,19 @@ class OrderSequencer:
 
         all_orders = list(all_orders_dict.values())
         all_orders.sort(key=lambda o: (o.date_created, o.time_created_seconds))
+
+        # Anchor sim time to midnight of the earliest order date so that
+        # release_seconds is monotonically increasing across day boundaries.
+        if all_orders:
+            self._epoch_date: int = all_orders[0].date_created
+            epoch_dt = datetime.strptime(str(self._epoch_date), "%Y%m%d").date()
+            for order in all_orders:
+                order_dt = datetime.strptime(str(order.date_created), "%Y%m%d").date()
+                days_offset = (order_dt - epoch_dt).days
+                order.release_seconds = days_offset * 86400 + order.time_created_seconds
+        else:
+            self._epoch_date = 0
+
         self._pending: List[Order] = all_orders
 
         self._active_queue: collections.deque[Order] = collections.deque()
@@ -110,14 +129,18 @@ class OrderSequencer:
         self._sku_to_bins: Dict[int, List["LogicalBin"]] = {}
 
         logger.info(
-            "OrderSequencer loaded: orders=%d unique_skus=%d "
-            "first_release_d=%d first_release_s=%d last_release_d=%d last_release_s=%d steps_per_second=%.2f",
+            "OrderSequencer loaded: orders=%d unique_skus=%d epoch_date=%d "
+            "first_release_d=%d first_release_s=%d first_abs_s=%d "
+            "last_release_d=%d last_release_s=%d last_abs_s=%d steps_per_second=%.2f",
             len(self._pending),
             len(self._unique_skus),
+            self._epoch_date,
             self._pending[0].date_created if self._pending else 0,
             self._pending[0].time_created_seconds if self._pending else 0,
+            self._pending[0].release_seconds if self._pending else 0,
             self._pending[-1].date_created if self._pending else 0,
             self._pending[-1].time_created_seconds if self._pending else 0,
+            self._pending[-1].release_seconds if self._pending else 0,
             self._steps_per_second,
         )
 
@@ -143,7 +166,7 @@ class OrderSequencer:
         """
         simulated_seconds = current_step / self._steps_per_second
         released: List[Order] = []
-        while self._pending and self._pending[0].time_created_seconds <= simulated_seconds:
+        while self._pending and self._pending[0].release_seconds <= simulated_seconds:
             order = self._pending.pop(0)
             self._active_queue.append(order)
             for sku_entry in order.skus:
@@ -174,7 +197,7 @@ class OrderSequencer:
         self._pending.extend(self._active_queue)
         self._active_queue.clear()
         self._pending_sku_requests.clear()
-        self._pending.sort(key=lambda o: (o.date_created, o.time_created_seconds))
+        self._pending.sort(key=lambda o: o.release_seconds)
         logger.info(
             "OrderSequencer reset: re-queued=%d total_pending=%d",
             requeued, len(self._pending),
