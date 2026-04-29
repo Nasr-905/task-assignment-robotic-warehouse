@@ -33,6 +33,7 @@ _FIXING_CLASH_TIME = 4
 _STUCK_THRESHOLD = 5
 _PICKER_BLOCKED_REROUTE_THRESHOLD = 4  # consecutive blocked steps before a picker detours
 _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
+_PICKER_CAPACITY = 10  # Number of item-units a picker can carry per trip (e.g. 10 units of SKU A, or 5 units of SKU A + 5 units of SKU B)
 _AGV_TRANSFER_SECONDS = 1.0  # Simulated seconds an AGV spends loading/unloading a bin
 # Tiles:
 # - 0: AGV highway
@@ -270,7 +271,7 @@ class PickerTask:
 
 class Picker(Entity):
     counter = 0
-    CAPACITY: int = 10  # default number of item-units a picker can carry per trip
+    CAPACITY: int = _PICKER_CAPACITY  # default number of item-units a picker can carry per trip
 
     def __init__(self, x: int, y: int, dir_: Direction):
         Picker.counter += 1
