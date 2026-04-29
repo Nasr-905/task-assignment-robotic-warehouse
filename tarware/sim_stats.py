@@ -73,6 +73,7 @@ STEP_FIELD_NAMES = (
     "picker_fatigue_mean",
     "picker_fatigue_max",
     "picker_energy_total",
+    "items_picked",
 )
 
 DEFAULT_ENTITY_FIELDS = (
@@ -109,6 +110,7 @@ DEFAULT_STEP_FIELDS = (
     "stucks",
     "agvs_distance_travelled",
     "agvs_idle_time",
+    "items_picked",
 )
 
 VALID_ROLES = ("agv", "picker")
@@ -480,6 +482,8 @@ class SimulationStatsTracker:
             return info.get("picker_fatigue_max")
         if field == "picker_energy_total":
             return info.get("picker_energy_total")
+        if field == "items_picked":
+            return info.get("items_picked")
         raise ValueError(f"Unsupported step stats field: {field}")
 
     def _entity_field_value(

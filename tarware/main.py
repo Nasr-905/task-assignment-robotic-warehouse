@@ -85,25 +85,32 @@ def build_env_id(size: str, agvs: int, pickers: int, obs_type: str = "partial") 
 
 
 def _map_csv_path_for_size(size: str) -> Path:
-    return (
-        Path(__file__).resolve().parent.parent
-        / "data"
-        / "maps"
-        / f"{size}.csv"
-    )
+    maps_dir = Path(__file__).resolve().parent.parent / "data" / "maps"
+    plain = maps_dir / f"{size}.csv"
+    if plain.exists():
+        return plain
+    dhl = maps_dir / f"{size}_dhl.csv"
+    if dhl.exists():
+        return dhl
+    return plain  # let make_base_env raise the FileNotFoundError with the plain path
 
 
 def make_base_env(args) -> gym.Env:
     map_csv_path = _map_csv_path_for_size(args.size)
     if not map_csv_path.exists():
         raise FileNotFoundError(f"Map CSV not found for size={args.size!r}: {map_csv_path}")
+    map_json_path = map_csv_path.with_suffix(".json")
+    if not map_json_path.exists():
+        raise FileNotFoundError(f"Map JSON not found for size={args.size!r}: {map_json_path}")
 
     return gym.make(
         tarware.ENV_ID,
         map_csv_path=map_csv_path,
+        map_json_path=map_json_path,
         num_agvs=args.agvs,
         num_pickers=args.pickers,
         observation_type=args.obs_type,
+        max_steps=args.steps,
         disable_env_checker=not args.enable_env_checker,
     )
 
@@ -326,11 +333,11 @@ def _apply_auto_150_uph_picker_defaults(args) -> None:
 
 
 def run_classical_eval(args) -> None:
-    env = gym.make(tarware.ENV_ID)
+    env, env_id = get_env_and_id(args)
     args.stats_write_entity_csv = not args.stats_no_entity_csv
     args.stats_write_step_csv = not args.stats_no_step_csv
-    tracker = SimulationStatsTracker.from_args(args, run_name="classical_eval", env_id=tarware.ENV_ID)
-    LOGGER.info("classical_eval env_id=%s", tarware.ENV_ID)
+    tracker = SimulationStatsTracker.from_args(args, run_name="classical_eval", env_id=env_id)
+    LOGGER.info("classical_eval env_id=%s", env_id)
     try:
         for episode in range(args.episodes):
             episode_seed = args.seed + episode
