@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -264,9 +265,63 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
         help="Base random seed.",
     )
     parser.add_argument(
+        "--disable-auto-150-uph",
+        action="store_true",
+        help="Disable automatic 150-UPH picker calibration defaults for medium single-picker runs.",
+    )
+    parser.add_argument(
         "--enable-env-checker",
         action="store_true",
         help="Enable Gymnasium passive env checker warnings.",
+    )
+
+
+def _apply_auto_150_uph_picker_defaults(args) -> None:
+    """Auto-configure medium-map single-picker runs near 150 UPH.
+
+    Behavior:
+    - Applies only when size=medium and pickers=1.
+    - Preserves any explicit env values set by the user.
+    - Can be disabled by --disable-auto-150-uph or TARWARE_AUTO_150_UPH=0.
+    """
+    if getattr(args, "disable_auto_150_uph", False):
+        return
+    if os.getenv("TARWARE_AUTO_150_UPH", "1").strip().lower() in {"0", "false", "no"}:
+        return
+    if getattr(args, "size", None) != "medium" or int(getattr(args, "pickers", 0)) != 1:
+        return
+
+    if int(getattr(args, "agvs", 0)) < 40:
+        args.agvs = 40
+
+    low_slow_profile = {
+        "pick_duration_fatigue_gain": 0.80,
+        "movement_delay_base_prob": 0.08,
+        "movement_delay_fatigue_prob_gain": 0.02,
+        "failed_pick_base_prob": 0.10,
+        "failed_pick_fatigue_prob_gain": 0.05,
+        "failed_pick_delay_seconds": 2.0,
+        "fatigue_recovery_per_second": 0.20,
+    }
+
+    defaults = {
+        "TARWARE_PICK_BASE_TICKS": "11",
+        "TARWARE_PICK_BASE_SECONDS": "13.0",
+        "TARWARE_PICK_QUANTITY_EXTRA_SECONDS": "20.0",
+        "TARWARE_PICKER_NOMINAL_SPEED_M_S": "0.32",
+        "TARWARE_HF_ENABLED": "1",
+        "TARWARE_HF_DEFAULT_PROFILE": "low",
+        "TARWARE_HF_PICKER_PROFILE_OVERRIDES": '{"0":"low"}',
+        "TARWARE_HF_PROFILE_LOW": json.dumps(low_slow_profile),
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+    LOGGER.info(
+        "auto_150_uph_picker enabled (size=medium,pickers=1): agvs=%d pick_ticks=%s pick_base_seconds=%s",
+        args.agvs,
+        os.environ.get("TARWARE_PICK_BASE_TICKS"),
+        os.environ.get("TARWARE_PICK_BASE_SECONDS"),
     )
 
 
@@ -483,6 +538,8 @@ def main() -> None:
 
     if getattr(args, "agvs", 1) < 1:
         parser.error("--agvs must be >= 1")
+
+    _apply_auto_150_uph_picker_defaults(args)
 
     args.func(args)
 
