@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 _FIXING_CLASH_TIME = 4
 _STUCK_THRESHOLD = 5
 _PICKER_BLOCKED_REROUTE_THRESHOLD = 4  # consecutive blocked steps before a picker detours
-_PICK_TICKS = 11  # Calibrated base pick ticks for ~150 UPH tests with 1 picker
+_PICK_TICKS = 11  # Default base pick ticks for general scenarios
+_LARGE_SINGLE_PICKER_TICKS = 5  # Targets ~150 UPH early-run on large/full maps with one picker
 _PICKER_CAPACITY = 12  # Number of item-units a picker can carry per trip (e.g. 12 units of SKU A, or 6 units of SKU A + 6 units of SKU B)
 _AGV_TRANSFER_SECONDS = 1.0  # Simulated seconds an AGV spends loading/unloading a bin
 # Tiles:
@@ -296,6 +297,13 @@ class Warehouse(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"]}
 
+    @staticmethod
+    def _default_pick_base_ticks(map_csv_path: Path, num_pickers: int) -> int:
+        map_name = map_csv_path.stem.lower()
+        if num_pickers == 1 and (map_name.startswith("large") or map_name.startswith("full")):
+            return _LARGE_SINGLE_PICKER_TICKS
+        return _PICK_TICKS
+
     def __init__(
         self,
         map_csv_path: Path,
@@ -345,7 +353,8 @@ class Warehouse(gym.Env):
             "true",
             "yes",
         )
-        self.pick_base_ticks = int(os.getenv("TARWARE_PICK_BASE_TICKS", str(_PICK_TICKS)))
+        default_pick_base_ticks = self._default_pick_base_ticks(map_csv_path, num_pickers)
+        self.pick_base_ticks = int(os.getenv("TARWARE_PICK_BASE_TICKS", str(default_pick_base_ticks)))
         self.pick_unit_cube_tick_scale = float(os.getenv("TARWARE_PICK_UNIT_CUBE_TICK_SCALE", "1.0"))
         self.agv_transfer_base_seconds = max(
             self.time_config.simulated_seconds_per_step,
