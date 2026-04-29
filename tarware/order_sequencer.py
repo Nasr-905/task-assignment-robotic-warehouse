@@ -16,6 +16,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Operating-hour time model:
+# The simulation only runs during operating hours. Stepping advances
+# "active" sim seconds; the gap between ACTIVE_END_HOUR and
+# ACTIVE_START_HOUR (next day) is collapsed to zero, and orders that
+# arrived during the gap are released as a single batch at the start
+# of the next operating window. Step 0 corresponds to ACTIVE_START_HOUR
+# on the earliest order date.
+ACTIVE_START_HOUR = 9    # 9am - sim begins each day at this hour
+ACTIVE_END_HOUR   = 23   # 11pm - sim jumps to next day's start hour
+SECONDS_PER_HOUR  = 3600
+SECONDS_PER_DAY   = 24 * SECONDS_PER_HOUR
+
+
 def _find_column(df: pd.DataFrame, stripped_name: str) -> Optional[str]:
     """Return the actual CSV column whose stripped name matches."""
     for column in df.columns:
@@ -66,8 +79,21 @@ class OrderSequencer:
     into an active FIFO queue keyed by simulated seconds.
     """
 
-    def __init__(self, csv_path: str | Path, steps_per_simulated_second: float = 1.0):
+    def __init__(
+        self,
+        csv_path: str | Path,
+        steps_per_simulated_second: float = 1.0,
+        active_start_hour: int = ACTIVE_START_HOUR,
+        active_end_hour: int = ACTIVE_END_HOUR,
+    ):
+        if not 0 <= active_start_hour < active_end_hour <= 24:
+            raise ValueError(
+                f"Invalid operating window {active_start_hour}h-{active_end_hour}h"
+            )
         self._steps_per_second = steps_per_simulated_second
+        self._active_start_s = active_start_hour * SECONDS_PER_HOUR
+        self._active_end_s = active_end_hour * SECONDS_PER_HOUR
+        self._active_duration_s = self._active_end_s - self._active_start_s
 
         df = pd.read_csv(csv_path).dropna(subset=["SKU", "Time Created"])
         unit_cube_column = _find_column(df, "Unit cube F")
@@ -94,15 +120,22 @@ class OrderSequencer:
         all_orders = list(all_orders_dict.values())
         all_orders.sort(key=lambda o: (o.date_created, o.time_created_seconds))
 
-        # Anchor sim time to midnight of the earliest order date so that
-        # release_seconds is monotonically increasing across day boundaries.
+        # Anchor sim time to ACTIVE_START_HOUR of the earliest order date.
+        # Each order's release_seconds is the *active* sim time (operating
+        # hours only) at which it should release. Orders arriving outside
+        # the active window are batched to the next window's start.
         if all_orders:
             self._epoch_date: int = all_orders[0].date_created
             epoch_dt = datetime.strptime(str(self._epoch_date), "%Y%m%d").date()
             for order in all_orders:
                 order_dt = datetime.strptime(str(order.date_created), "%Y%m%d").date()
                 days_offset = (order_dt - epoch_dt).days
-                order.release_seconds = days_offset * 86400 + order.time_created_seconds
+                order.release_seconds = self._wall_to_active_seconds(
+                    days_offset, order.time_created_seconds
+                )
+            # release_seconds may not match the (date, time-of-day) order
+            # because late-night orders get pushed to next day's window.
+            all_orders.sort(key=lambda o: o.release_seconds)
         else:
             self._epoch_date = 0
 
@@ -128,21 +161,48 @@ class OrderSequencer:
             self._sku_unit_cube = {sku: 0.0 for sku in self._unique_skus}
         self._sku_to_bins: Dict[int, List["LogicalBin"]] = {}
 
+        overnight_at_start = sum(
+            1 for o in self._pending if o.release_seconds == 0
+        )
         logger.info(
             "OrderSequencer loaded: orders=%d unique_skus=%d epoch_date=%d "
-            "first_release_d=%d first_release_s=%d first_abs_s=%d "
-            "last_release_d=%d last_release_s=%d last_abs_s=%d steps_per_second=%.2f",
+            "active_window=%dh-%dh active_day_s=%d "
+            "first_release_d=%d first_release_s=%d first_active_s=%d "
+            "last_release_d=%d last_release_s=%d last_active_s=%d "
+            "overnight_at_step0=%d steps_per_second=%.2f",
             len(self._pending),
             len(self._unique_skus),
             self._epoch_date,
+            self._active_start_s // SECONDS_PER_HOUR,
+            self._active_end_s // SECONDS_PER_HOUR,
+            self._active_duration_s,
             self._pending[0].date_created if self._pending else 0,
             self._pending[0].time_created_seconds if self._pending else 0,
             self._pending[0].release_seconds if self._pending else 0,
             self._pending[-1].date_created if self._pending else 0,
             self._pending[-1].time_created_seconds if self._pending else 0,
             self._pending[-1].release_seconds if self._pending else 0,
+            overnight_at_start,
             self._steps_per_second,
         )
+
+    def _wall_to_active_seconds(self, days_offset: int, t_of_day_s: int) -> int:
+        """Map a wall-clock arrival ``(days_offset, t_of_day_s)`` to the
+        active sim second at which the order should release.
+
+        Orders arriving before the active window release at the start of
+        that day's window; orders arriving after the active window release
+        at the start of the next day's window; orders inside the window
+        release at their offset into it.
+        """
+        if t_of_day_s < self._active_start_s:
+            return days_offset * self._active_duration_s
+        if t_of_day_s < self._active_end_s:
+            return (
+                days_offset * self._active_duration_s
+                + (t_of_day_s - self._active_start_s)
+            )
+        return (days_offset + 1) * self._active_duration_s
 
     def get_unique_skus(self) -> List[int]:
         """Return unique SKUs found in the order file."""
