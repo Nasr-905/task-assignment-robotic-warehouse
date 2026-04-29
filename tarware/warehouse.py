@@ -33,6 +33,7 @@ _FIXING_CLASH_TIME = 4
 _STUCK_THRESHOLD = 5
 _PICKER_BLOCKED_REROUTE_THRESHOLD = 4  # consecutive blocked steps before a picker detours
 _PICK_TICKS = 3  # Steps a picker spends picking from a shelf
+_AGV_TRANSFER_SECONDS = 1.0  # Simulated seconds an AGV spends loading/unloading a bin
 # Tiles:
 # - 0: AGV highway
 # - 1: shelf/storage
@@ -130,6 +131,7 @@ class Agent(Entity):
         self.target = 0
         self.motion_credit_cells: float = 0.0
         self.speed_limited_this_step: bool = False
+        self.transfer_ticks_remaining: int = 0
 
     def req_location(self, grid_size) -> Tuple[int, int]:
         if self.req_action != Action.FORWARD:
@@ -344,6 +346,10 @@ class Warehouse(gym.Env):
         )
         self.pick_base_ticks = int(os.getenv("TARWARE_PICK_BASE_TICKS", str(_PICK_TICKS)))
         self.pick_unit_cube_tick_scale = float(os.getenv("TARWARE_PICK_UNIT_CUBE_TICK_SCALE", "1.0"))
+        self.agv_transfer_base_seconds = max(
+            self.time_config.simulated_seconds_per_step,
+            float(os.getenv("TARWARE_AGV_TRANSFER_BASE_SECONDS", str(_AGV_TRANSFER_SECONDS))),
+        )
         self.human_factors_config = HumanFactorsConfig.from_env(
             map_name=Path(map_csv_path).stem,
             time_config=self.time_config,
@@ -750,6 +756,7 @@ class Warehouse(gym.Env):
         agv.busy = False
         agv.target = 0
         agv.req_action = Action.NOOP
+        agv.transfer_ticks_remaining = 0
 
     def find_agv_path(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for an AGV on the highway grid. Returns [] if no path exists."""
@@ -1116,6 +1123,7 @@ class Warehouse(gym.Env):
                             )
                             agent.req_action = Action.NOOP
                             agent.busy = False
+                            agent.transfer_ticks_remaining = 0
         return agvs_distance_travelled
 
     def resolve_move_conflict(self, agent_list):
@@ -1340,7 +1348,7 @@ class Warehouse(gym.Env):
             for agent in self.agents
             if agent.busy
             and agent.req_action not in (Action.LEFT, Action.RIGHT) # Don't count changing directions
-            and (agent.req_action!=Action.TOGGLE_LOAD or (agent.x, agent.y) in self.goals or (agent.x, agent.y) in self._agv_entry_to_goal) # Don't count loading at goal or entry cell
+            and agent.req_action != Action.TOGGLE_LOAD # Don't count loading/unloading transfer time as stuck
         ]
         for agent in moving_agents:
             agent_stuck_count = self.stuck_counters[agent.id - 1]
@@ -1360,6 +1368,29 @@ class Warehouse(gym.Env):
 
     def _execute_rotation(self, agent: Agent) -> None:
         agent.dir = agent.req_direction()
+
+    def _agv_transfer_ticks(self) -> int:
+        return max(1, self.simulated_seconds_to_steps(self.agv_transfer_base_seconds))
+
+    def _execute_agv_transfer(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
+        if agent.transfer_ticks_remaining <= 0:
+            agent.transfer_ticks_remaining = self._agv_transfer_ticks()
+            logger.debug(
+                "step=%d agv_id=%d: started bin transfer action_id=%d (transfer_ticks=%d)",
+                self._cur_steps,
+                agent.id,
+                agent.target,
+                agent.transfer_ticks_remaining,
+            )
+
+        agent.transfer_ticks_remaining -= 1
+        if agent.transfer_ticks_remaining > 0:
+            return rewards
+
+        agent.transfer_ticks_remaining = 0
+        if not agent.carrying_bin:
+            return self._execute_load(agent, rewards)
+        return self._execute_unload(agent, rewards)
 
     def _execute_load(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
         """Pick up the bin at agent.target's (shelf_id, slot_idx)."""
@@ -1518,10 +1549,7 @@ class Warehouse(gym.Env):
             elif agent.req_action in [Action.LEFT, Action.RIGHT]:
                 self._execute_rotation(agent)
             elif agent.req_action == Action.TOGGLE_LOAD:
-                if not agent.carrying_bin:
-                    rewards = self._execute_load(agent, rewards)
-                else:
-                    rewards = self._execute_unload(agent, rewards)
+                rewards = self._execute_agv_transfer(agent, rewards)
         return rewards
 
     def process_shelf_deliveries(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
@@ -3192,6 +3220,11 @@ class Warehouse(gym.Env):
         info["motion_speed_model"] = "physical_m_s" if self._use_physical_speed_model else "cells_per_step"
         info["agv_cells_per_step_configured"] = float(self._agv_cells_per_step_configured)
         info["agv_cells_per_step_effective"] = float(self._agv_cells_per_step_effective)
+        info["agv_transfer_base_seconds"] = float(self.agv_transfer_base_seconds)
+        info["agv_transfer_ticks_remaining"] = np.array(
+            [agent.transfer_ticks_remaining for agent in self.agents],
+            dtype=np.int32,
+        )
         info["picker_cells_per_step_configured"] = float(self._picker_cells_per_step_configured)
         info["picker_cells_per_step_effective"] = float(self._picker_cells_per_step_effective)
         info["agv_nominal_speed_m_s"] = float(self.time_config.agv_nominal_speed_m_s)

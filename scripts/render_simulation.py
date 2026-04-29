@@ -6,6 +6,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 
 def choose_actions(env, rng):
@@ -18,6 +19,9 @@ def choose_actions(env, rng):
 
 
 def main():
+    repo_root = Path(__file__).resolve().parents[1]
+    load_dotenv(repo_root / ".env", override=True)
+
     parser = argparse.ArgumentParser(description="Run a live rendered TA-RWARE simulation.")
     parser.add_argument("--map-name", default="extralarge")
     parser.add_argument("--steps", type=int, default=1000)
@@ -52,7 +56,7 @@ def main():
 
     tile_size = args.tile_size
     if tile_size is None:
-        map_path = Path(__file__).resolve().parents[1] / "data" / "maps" / f"{args.map_name}.csv"
+        map_path = repo_root / "data" / "maps" / f"{args.map_name}.csv"
         rows, cols = pd.read_csv(map_path, header=None).shape
         tile_size = max(4, min((args.fit_width - 1) // cols - 1, (args.fit_height - 1) // rows - 1))
     os.environ["TARWARE_RENDER_TILE_SIZE"] = str(tile_size)
@@ -68,6 +72,7 @@ def main():
     print(f"shared cells: {len(env.unwrapped.shared_highway_locs)}")
     print(f"tile size: {tile_size}px")
     print(f"agents: {args.agvs} AGVs, {args.pickers} pickers")
+    print(f"AGV transfer time: {env.unwrapped.agv_transfer_base_seconds:g}s")
     print(
         "picker model: {policy}, overflow={overflow}, stall_p={stall}, "
         "sku_size_time={sku_time}".format(
