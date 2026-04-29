@@ -277,6 +277,11 @@ def add_common_env_args(parser: argparse.ArgumentParser) -> None:
         help="Disable automatic 150-UPH picker calibration defaults for medium single-picker runs.",
     )
     parser.add_argument(
+        "--disable-fatigue",
+        action="store_true",
+        help="Disable human-factors fatigue effects for this run (equivalent to TARWARE_HF_ENABLED=0).",
+    )
+    parser.add_argument(
         "--enable-env-checker",
         action="store_true",
         help="Enable Gymnasium passive env checker warnings.",
@@ -473,7 +478,15 @@ def run_rl_eval(args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="TA-RWARE runner with classical and RL subcommands.")
+    parser = argparse.ArgumentParser(
+        description="TA-RWARE runner with classical and RL subcommands.",
+        epilog=(
+            "Fatigue controls:\n"
+            "  - Disable fatigue via CLI: --disable-fatigue\n"
+            "  - Disable fatigue via env: TARWARE_HF_ENABLED=0"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--log-level",
         default=os.getenv("TARWARE_LOG_LEVEL", "INFO"),
@@ -545,6 +558,9 @@ def main() -> None:
 
     if getattr(args, "agvs", 1) < 1:
         parser.error("--agvs must be >= 1")
+
+    if getattr(args, "disable_fatigue", False):
+        os.environ["TARWARE_HF_ENABLED"] = "0"
 
     _apply_auto_150_uph_picker_defaults(args)
 
