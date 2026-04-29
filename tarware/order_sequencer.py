@@ -315,3 +315,17 @@ class OrderSequencer:
     @property
     def active_count(self) -> int:
         return len(self._active_queue)
+
+    @property
+    def has_future_orders(self) -> bool:
+        """True while orders remain time-gated awaiting release."""
+        return len(self._pending) > 0
+
+    @property
+    def is_fully_drained(self) -> bool:
+        """True when the CSV is fully consumed: no future releases and no
+        SKU requests waiting to be claimed by an AGV. Caller should also
+        verify the warehouse-side pickerwall queue is empty before calling
+        the run finished.
+        """
+        return len(self._pending) == 0 and len(self._pending_sku_requests) == 0

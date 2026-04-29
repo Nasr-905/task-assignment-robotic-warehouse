@@ -3172,13 +3172,47 @@ class Warehouse(gym.Env):
 
         self._recalc_grid()
         self._cur_steps += 1
-        if (
+
+        # Termination logic.
+        #   max_steps > 0          -> classic time-limited run.
+        #   max_steps == -1        -> "run to completion": end only when
+        #                             the sequencer + pickerwall are drained.
+        #   max_inactivity_steps   -> still applies as a deadlock detector,
+        #                             but in run-to-completion mode it is
+        #                             suppressed while the sequencer has
+        #                             future orders waiting to release
+        #                             (agents are legitimately waiting for
+        #                             a time-gated batch, not stalled).
+        run_to_completion = (self.max_steps == -1)
+
+        hit_max_steps = bool(
+            self.max_steps
+            and self.max_steps > 0
+            and self._cur_steps >= self.max_steps
+        )
+
+        suppress_inactivity = (
+            run_to_completion
+            and self.order_sequencer is not None
+            and self.order_sequencer.has_future_orders
+        )
+        hit_inactivity = bool(
             self.max_inactivity_steps
             and self._cur_inactive_steps >= self.max_inactivity_steps
-        ) or (self.max_steps and self._cur_steps >= self.max_steps):
+            and not suppress_inactivity
+        )
+
+        fully_drained = (
+            run_to_completion
+            and self.order_sequencer is not None
+            and self.order_sequencer.is_fully_drained
+            and len(self._pickerwall_pending) == 0
+        )
+
+        if hit_max_steps or hit_inactivity or fully_drained:
             terminateds = truncateds = self.num_agents * [True]
         else:
-            terminateds = truncateds =  self.num_agents * [False]
+            terminateds = truncateds = self.num_agents * [False]
 
         self.observation_space_mapper.extract_environment_info(self)
         new_obs = tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
