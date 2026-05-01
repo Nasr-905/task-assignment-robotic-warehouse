@@ -152,10 +152,13 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                     empty_location_ids = [i for i in empty_location_ids if i not in busy_loc_ids]
                     if empty_location_ids:
                         empty_yx = [location_map[i] for i in empty_location_ids]
-                        dists = [len(p) if p else float('inf')
-                                 for p in (env.find_agv_path((agv.y, agv.x), yx, care_for_agents=False)
-                                           for yx in empty_yx)]
-                        best_id = empty_location_ids[np.argmin(dists)]
+                        # Manhattan-distance selection. The env recomputes the
+                        # actual A* path for the chosen target on the next step,
+                        # so picking by Manhattan saves N redundant A* calls per
+                        # selection at the cost of an occasionally-suboptimal
+                        # idle-pool choice. yx is (row, col).
+                        dists = [abs(agv.y - yx[0]) + abs(agv.x - yx[1]) for yx in empty_yx]
+                        best_id = empty_location_ids[int(np.argmin(dists))]
                         best_yx = location_map[best_id]
                         assigned_agvs.pop(agv)
                         assigned_agvs[agv] = Mission(MissionType.RETURNING, best_id,
@@ -173,14 +176,11 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                     ]
 
                     if candidate_goals:
-                        goal_paths = [
-                            env.find_agv_path_to_goal_entry(
-                                (agv.y, agv.x), goal_xy, care_for_agents=False
-                            )
-                            for goal_xy in candidate_goals
-                        ]
-                        goal_dists = [len(p) if p else float('inf') for p in goal_paths]
-                        closest = candidate_goals[np.argmin(goal_dists)]  # (x, y) of cell
+                        # Manhattan over goal_xy = (col, row). Skips the per-slot
+                        # find_agv_path_to_goal_entry A* — see note above.
+                        goal_dists = [abs(agv.y - g[1]) + abs(agv.x - g[0])
+                                      for g in candidate_goals]
+                        closest = candidate_goals[int(np.argmin(goal_dists))]  # (x, y) of cell
                         goal_id = _pickerwall_action_for_empty_slot(closest, reserved_delivering_ids)
                         if goal_id is None:
                             continue
@@ -282,14 +282,10 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
             goal_id = _pickerwall_action_for_depleted_fulfilled_bin(goal_xy, displacement_reserved_ids)
             if goal_id is None:
                 continue
-            agv_paths = [
-                env.find_agv_path_to_goal_entry((a.y, a.x), goal_xy, care_for_agents=False)
-                for a in free_agvs
-            ]
-            agv_dists = [len(p) if p else float('inf') for p in agv_paths]
-            if all(d == float('inf') for d in agv_dists):
-                continue
-            chosen = free_agvs[np.argmin(agv_dists)]
+            # Manhattan over goal_xy = (col, row); pick the closest free AGV.
+            agv_dists = [abs(a.y - goal_xy[1]) + abs(a.x - goal_xy[0])
+                         for a in free_agvs]
+            chosen = free_agvs[int(np.argmin(agv_dists))]
             _claim_agv(chosen)
             assigned_agvs[chosen] = Mission(
                 MissionType.PICKING,
@@ -313,13 +309,9 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 goal_id = _pickerwall_action_for_fulfilled_bin(goal_xy, displacement_reserved_ids)
                 if goal_id is None:
                     continue
-                agv_paths = [env.find_agv_path_to_goal_entry(
-                                (a.y, a.x), goal_xy, care_for_agents=False)
+                agv_dists = [abs(a.y - goal_xy[1]) + abs(a.x - goal_xy[0])
                              for a in free_agvs]
-                agv_dists = [len(p) if p else float('inf') for p in agv_paths]
-                if all(d == float('inf') for d in agv_dists):
-                    continue  # no AGV can reach this displacement goal; try next
-                chosen = free_agvs[np.argmin(agv_dists)]
+                chosen = free_agvs[int(np.argmin(agv_dists))]
                 _claim_agv(chosen)
                 assigned_agvs[chosen] = Mission(MissionType.PICKING, goal_id,
                                                 goal_xy[0], goal_xy[1], timestep)
@@ -354,12 +346,10 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 if not available_agvs:
                     continue
 
-                agv_paths = [env.find_agv_path((a.y, a.x), (item.y, item.x), care_for_agents=False)
-                            for a in available_agvs]
-                agv_dists = [len(p) if p else float('inf') for p in agv_paths]
-                if all(d == float('inf') for d in agv_dists):
-                    continue  # no AGV can reach this item; try next
-                closest_agv = available_agvs[np.argmin(agv_dists)]
+                # Manhattan over (item.y, item.x); pick closest free AGV.
+                agv_dists = [abs(a.y - item.y) + abs(a.x - item.x)
+                             for a in available_agvs]
+                closest_agv = available_agvs[int(np.argmin(agv_dists))]
                 item_location_id = env.slot_to_action_id.get((item.shelf_id, item.slot_index))
                 if item_location_id is None:
                     continue
@@ -384,11 +374,8 @@ def heuristic_episode(env, render=False, seed=None, render_start=0, render_skip=
                 if not candidate_ids:
                     break
                 candidate_xy = [idle_action_id_to_xy[aid] for aid in candidate_ids]
-                paths = [env.find_agv_path((agv.y, agv.x), (y, x), care_for_agents=False)
-                         for (x, y) in candidate_xy]
-                dists = [len(p) if p else float('inf') for p in paths]
-                if all(d == float('inf') for d in dists):
-                    continue  # no reachable idle cell for this AGV this tick
+                # Manhattan over (x, y) candidates.
+                dists = [abs(agv.y - y) + abs(agv.x - x) for (x, y) in candidate_xy]
                 best_idx = int(np.argmin(dists))
                 idle_id = candidate_ids[best_idx]
                 idle_x, idle_y = candidate_xy[best_idx]

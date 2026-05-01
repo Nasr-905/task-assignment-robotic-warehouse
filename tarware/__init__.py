@@ -65,6 +65,15 @@ elif _REWARD_TYPE == "two_stage":
     _REWARD_TYPE = RewardType.TWO_STAGE
 else:
     raise ValueError(f"Invalid reward type: {_REWARD_TYPE}. Must be 'individual', 'global', or 'two_stage'.")
+# Picker model: "abstract" replaces physical pickers with a constant-rate FIFO
+# drain at TARWARE_ABSTRACT_PICKER_UPH per picker (default 150 UPH). Use
+# "physical" to keep the legacy Picker entity simulation.
+_PICKER_MODEL = os.getenv("TARWARE_PICKER_MODEL", "abstract").lower()
+if _PICKER_MODEL not in ("abstract", "physical"):
+    raise ValueError(
+        f"TARWARE_PICKER_MODEL must be 'abstract' or 'physical', got {_PICKER_MODEL!r}"
+    )
+_ABSTRACT_PICKER_UPH = float(os.getenv("TARWARE_ABSTRACT_PICKER_UPH", 150.0))
 # Fit width for rendering
 _FIT_WIDTH = os.getenv("TARWARE_RENDER_WIDTH", None)
 if _FIT_WIDTH is not None:
@@ -93,5 +102,7 @@ gym.register(
         "reward_type": _REWARD_TYPE,
         "fit_width": _FIT_WIDTH,
         "fit_height": _FIT_HEIGHT,
+        "picker_model": _PICKER_MODEL,
+        "abstract_picker_uph": _ABSTRACT_PICKER_UPH,
     },
 )

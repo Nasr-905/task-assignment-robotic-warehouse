@@ -64,19 +64,30 @@ def get_next_micro_action(agent_x, agent_y, agent_direction, target):
         return Action.RIGHT
 
 def find_sections(pairs, aisle_per_sections=1):
+    """Group cells into connected components by 4-adjacency.
+
+    Optimized from the original O(n²) per-pair nested scan (135M abs() calls
+    on full_dhl) to an O(n) algorithm using a (row, col) -> group_idx map.
+    For each new pair we look up its 4 neighbors in the map and pick the
+    earliest-created group among the matches — preserving the original
+    "first matching group wins" semantic, which means a cell that bridges
+    two pre-existing groups still attaches to only one (no merge).
+    """
+    cell_to_group = {}
     groups = []
-
     for pair in pairs:
-        added = False
-
-        for group in groups:
-            if any(abs(pair[0] - gp[0]) + abs(pair[1] - gp[1]) == 1 for gp in group):
-                group.append(pair)
-                added = True
-                break
-
-        if not added:
+        r, c = pair[0], pair[1]
+        chosen = None
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            gid = cell_to_group.get((r + dr, c + dc))
+            if gid is not None and (chosen is None or gid < chosen):
+                chosen = gid
+        if chosen is None:
+            cell_to_group[(r, c)] = len(groups)
             groups.append([pair])
+        else:
+            cell_to_group[(r, c)] = chosen
+            groups[chosen].append(pair)
 
     if aisle_per_sections > 1:
         groups.sort(key=lambda x: x[0][1])

@@ -312,8 +312,27 @@ class Warehouse(gym.Env):
         normalised_coordinates: bool = False,
         fit_width: Optional[int] = None,
         fit_height: Optional[int] = None,
+        picker_model: str = "abstract",
+        abstract_picker_uph: float = 150.0,
     ):
         """Multi-agent robotic warehouse gym environment."""
+        if picker_model not in ("abstract", "physical"):
+            raise ValueError(
+                f"picker_model must be 'abstract' or 'physical', got {picker_model!r}"
+            )
+        self.picker_model = picker_model
+        self.abstract_picker_uph = float(abstract_picker_uph)
+        self._abstract_picker_carry: float = 0.0
+        # SKUs we've already warned about being unfulfillable. Order CSVs
+        # routinely list more unique SKUs than the map has storage slots;
+        # `_initialize_bin_inventory` only seeds `min(skus, slots)` bins, so
+        # any leftover SKU has no bin anywhere. Without cleanup, orders for
+        # those SKUs accumulate in `_pending_sku_requests` and prevent
+        # `is_fully_drained` from ever being True.
+        self._stranded_sku_logged: set = set()
+        # Populated by `_initialize_bin_inventory`; initialised here so the
+        # attribute always exists (e.g. callers that probe state before reset).
+        self._skus_with_bin: set = set()
         self.steps_per_simulated_second = max(1e-6, float(steps_per_simulated_second))
         self.time_config = PhysicalTimeConfig.from_env(self.steps_per_simulated_second)
         self.bin_volume_ft3 = float(os.getenv("TARWARE_BIN_VOLUME_FT3", str(BIN_VOLUME_FT3)))
@@ -361,14 +380,23 @@ class Warehouse(gym.Env):
         self.action_size = len(self.action_id_to_coords_map) + 1
         self.action_space = spaces.Tuple(tuple(self.num_agents * [spaces.Discrete(self.action_size)]))
 
-        self.observation_space_mapper = observation_map[observation_type](
-            self.num_agvs,
-            self.grid_size,
-            self.num_non_goal_actions,
-            self.num_pickerwall_actions,
-            normalised_coordinates,
-        )
-        self.observation_space = spaces.Tuple(tuple(self.observation_space_mapper.ma_spaces))
+        # `none` mode skips observation construction entirely — useful for
+        # heuristic-driven runs (and the fleet tuner) that discard the obs
+        # tuple anyway. Real RL training should use `partial` or `global`.
+        if observation_type == "none":
+            self.observation_space_mapper = None
+            self.observation_space = spaces.Tuple(
+                tuple(spaces.Discrete(1) for _ in range(self.num_agents))
+            )
+        else:
+            self.observation_space_mapper = observation_map[observation_type](
+                self.num_agvs,
+                self.grid_size,
+                self.num_non_goal_actions,
+                self.num_pickerwall_actions,
+                normalised_coordinates,
+            )
+            self.observation_space = spaces.Tuple(tuple(self.observation_space_mapper.ma_spaces))
 
         self.request_queue_size = request_queue_size
         self.request_queue = []
@@ -761,32 +789,27 @@ class Warehouse(gym.Env):
 
     def find_agv_path(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for an AGV on the highway grid. Returns [] if no path exists."""
-        grid = np.zeros(self.grid_size)
+        # Build the blocked-cell boolean directly. The previous implementation
+        # round-tripped through float64 → list-of-lists → float32 (line 785
+        # in older revisions) which dominated the entire profile (~71% of
+        # total wall-clock at 30 AGVs on full_dhl).
+        blocked = (self.highways == 0)  # non-highway cells are blocked
         if care_for_agents:
-            grid += self.grid[CollisionLayers.AGVS]
-            grid += self.grid[CollisionLayers.PICKERS]
-        grid[goal[0], goal[1]] = 0
-
-        # AGVs travel only on highways but can access their specific target cell
-        grid += (1 - self.highways)
-        grid[goal[0], goal[1]] -= not self._is_highway(goal[1], goal[0])
-
-        start_fix = (0, 0)
-        grid[start[0]+start_fix[0], start[1]+start_fix[1]] = 0
-        grid = [list(map(int, l)) for l in (grid!=0)]
-        grid = np.array(grid, dtype=np.float32)
-        grid[np.where(grid == 1)] = np.inf
-        grid[np.where(grid == 0)] = 1
-        astar_path = pyastar2d.astar_path(grid, np.add(start, start_fix), goal, allow_diagonal=False)
-        if astar_path is not None:
-            astar_path = [tuple(x) for x in list(astar_path)]
-            astar_path = astar_path[1 - int(grid[start[0], start[1]] > 1):]
-
-        if astar_path:
-            return [(x, y) for y, x in astar_path]
-        else:
+            blocked = blocked | (self.grid[CollisionLayers.AGVS] != 0)
+            blocked = blocked | (self.grid[CollisionLayers.PICKERS] != 0)
+        # Always allow goal and start regardless of what landed there.
+        blocked[goal[0], goal[1]] = False
+        blocked[start[0], start[1]] = False
+        cost = np.where(blocked, np.float32(np.inf), np.float32(1.0))
+        astar_path = pyastar2d.astar_path(cost, np.array(start), np.array(goal), allow_diagonal=False)
+        if astar_path is None or len(astar_path) == 0:
             return []
-        
+        # `.tolist()` converts the (N, 2) ndarray to a nested Python list with
+        # native ints in C, which is faster than per-element int() calls in a
+        # listcomp. Slice first (cheap numpy view), then flip (r,c)->(c,r).
+        skip_start = 0 if cost[start[0], start[1]] > 1 else 1
+        return [(c, r) for r, c in astar_path[skip_start:].tolist()]
+
     def find_agv_path_through_adjacent_loc(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """Find path from start to goal that goes through via. Returns [] if no path exists."""
         gr, gc = goal
@@ -857,28 +880,19 @@ class Warehouse(gym.Env):
 
     def find_picker_path(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """A* path for a picker on picker_highways. Returns [] if no path exists."""
-        grid = np.zeros(self.grid_size)
+        # Same hot-path rewrite as find_agv_path: build the blocked mask
+        # directly instead of round-tripping through Python list-of-lists.
+        blocked = (self.picker_highways == 0)
         if care_for_agents:
-            grid += self.grid[CollisionLayers.PICKERS]
-        # Pickers can only traverse picker_highways cells
-        grid += (1 - self.picker_highways)
-        grid[goal[0], goal[1]] = 0
-        grid[start[0], start[1]] = 0
-
-        grid = [list(map(int, l)) for l in (grid != 0)]
-        grid = np.array(grid, dtype=np.float32)
-        grid[np.where(grid == 1)] = np.inf
-        grid[np.where(grid == 0)] = 1
-
-        astar_path = pyastar2d.astar_path(grid, np.array(start), np.array(goal), allow_diagonal=False)
-        if astar_path is not None:
-            astar_path = [tuple(x) for x in list(astar_path)]
-            astar_path = astar_path[1:]  # skip start position
-
-        if astar_path:
-            return [(x, y) for y, x in astar_path]
-        else:
+            blocked = blocked | (self.grid[CollisionLayers.PICKERS] != 0)
+        blocked[goal[0], goal[1]] = False
+        blocked[start[0], start[1]] = False
+        cost = np.where(blocked, np.float32(np.inf), np.float32(1.0))
+        astar_path = pyastar2d.astar_path(cost, np.array(start), np.array(goal), allow_diagonal=False)
+        if astar_path is None or len(astar_path) == 0:
             return []
+        # `.tolist()` for C-speed conversion; flip (r,c) -> (c,r); skip start.
+        return [(c, r) for r, c in astar_path[1:].tolist()]
 
     def find_picker_path_through_adjacent_loc(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
         """Find path from start to goal that goes through via. Returns [] if no path exists."""
@@ -1707,6 +1721,12 @@ class Warehouse(gym.Env):
         unique_skus = self.order_sequencer.get_unique_skus()
         self.order_sequencer._sku_to_bins = {}
         self._bins_by_id: Dict[int, LogicalBin] = {}
+        # SKUs that got a bin at init. These are recoverable after
+        # depletion (replenishment cycle re-fills them); SKUs *not* in
+        # this set have no bin anywhere and are permanently unfulfillable.
+        # Used by `_next_order_assignment` to distinguish "drop order"
+        # from "keep, bin will be back".
+        self._skus_with_bin: Set[int] = set()
 
         storage_slots: List[Tuple[Shelf, int]] = [
             (shelf, slot_idx)
@@ -1725,6 +1745,7 @@ class Warehouse(gym.Env):
             self._assign_sku_to_bin(bin_, sku)
             shelf.place_bin(bin_, slot_idx)
             self._bins_by_id[bin_.id] = bin_
+            self._skus_with_bin.add(int(sku))
 
         logger.info(
             "Bin inventory initialised: bins=%d unique_skus=%d storage_slots=%d slots_used=%d",
@@ -1894,6 +1915,8 @@ class Warehouse(gym.Env):
         self._cur_inactive_steps = 0
         self._cur_steps = 0
         self._step_deliveries = 0
+        self._abstract_picker_carry = 0.0
+        self._stranded_sku_logged.clear()
         self.seed(seed)
         self._bin_to_order = {}
         self._packaging_slots = {}
@@ -1949,7 +1972,7 @@ class Warehouse(gym.Env):
 
         Picker.counter = 0
         self.pickers = []
-        if len(self.picker_spawn_locs) > 0:
+        if self.picker_model == "physical" and len(self.picker_spawn_locs) > 0:
             picker_spawn_specs = self._balanced_picker_spawn_specs()
             for picker_index, (py, px, home_zone) in enumerate(picker_spawn_specs):
                 picker = Picker(int(px), int(py), Direction.UP)
@@ -2006,6 +2029,8 @@ class Warehouse(gym.Env):
                 np.random.choice(storage_bins, size=size, replace=False)
             ) if size > 0 else []
 
+        if self.observation_space_mapper is None:
+            return tuple([0] * self.num_agents)
         self.observation_space_mapper.extract_environment_info(self)
         return tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
 
@@ -2031,6 +2056,28 @@ class Warehouse(gym.Env):
         """
         carried_ids = {a.carrying_bin.id for a in self.agents if a.carrying_bin}
         queued_ids = {b.id for b in self.request_queue if b is not None}
+
+        # Drop requests for SKUs that never had a bin at init. These are
+        # permanently unfulfillable (storage capacity < unique-SKU count),
+        # and without cleanup they pile up in `_pending_sku_requests` and
+        # block `is_fully_drained` forever. Crucially we use
+        # `_skus_with_bin` (the init-time set), NOT `_sku_to_bins` — a SKU
+        # whose only bin is currently depleted is *temporarily* absent from
+        # `_sku_to_bins` and will recover via replenishment, so we must keep
+        # those orders queued. Reverse iteration so `del` by index is safe.
+        deq = self.order_sequencer._pending_sku_requests
+        skus_with_bin = self._skus_with_bin
+        for j in range(len(deq) - 1, -1, -1):
+            sku_entry_j, order_j = deq[j]
+            if sku_entry_j.sku not in skus_with_bin:
+                del deq[j]
+                if sku_entry_j.sku not in self._stranded_sku_logged:
+                    self._stranded_sku_logged.add(sku_entry_j.sku)
+                    logger.warning(
+                        "step=%d: dropping order=%s sku=%d — SKU has no bin "
+                        "in storage (likely storage capacity < unique-SKU count)",
+                        self._cur_steps, order_j.order_number, sku_entry_j.sku,
+                    )
 
         for i in range(len(self.order_sequencer._pending_sku_requests)):
             sku_entry, order = self.order_sequencer._pending_sku_requests[i]
@@ -3137,6 +3184,68 @@ class Warehouse(gym.Env):
                 picker.state = PickerState.IDLE
                 self._start_idle_relocation(picker)
 
+    def _drain_pickerwall_abstract(self) -> None:
+        """Constant-rate FIFO drain of `_pickerwall_pending`.
+
+        Replaces physical picker simulation: each step we have a budget of
+        ``num_pickers * abstract_picker_uph / (3600 * steps_per_simulated_second)``
+        item-units; we consume entries from `_pickerwall_pending` in
+        delivery order until the budget is exhausted. Fractional remainder
+        carries over to the next step. Each pop mirrors the physical
+        PICKING + AT_PACKAGING side effects: bin inventory decremented,
+        `_step_items_picked` accumulated, and the order's packaging slot
+        credited (creating it on first encounter, completing the order
+        when delivered >= required).
+        """
+        if self.num_pickers <= 0:
+            self._abstract_picker_carry = 0.0
+            return
+        budget = (self.num_pickers * self.abstract_picker_uph) / (
+            3600.0 * self.steps_per_simulated_second
+        ) + self._abstract_picker_carry
+        while budget >= 1.0 and self._pickerwall_pending:
+            entry = self._pop_pickerwall_entry_for_zone(zone_id=None)
+            if entry is None:
+                break
+            bin_id, sku_entry, order = entry
+            qty = int(sku_entry.quantity)
+            if qty <= 0:
+                continue
+            if qty > budget:
+                self._pickerwall_pending.appendleft(entry)
+                break
+            bin_ = self._bins_by_id.get(bin_id)
+            if bin_ is not None:
+                self._decrement_bin_inventory(bin_, qty)
+            self._step_items_picked += qty
+            slot = self._packaging_slots.get(order.order_number)
+            if slot is None:
+                total_qty = sum(se.quantity for se in order.skus)
+                required_per_sku: Dict[int, int] = {}
+                for se in order.skus:
+                    required_per_sku[se.sku] = required_per_sku.get(se.sku, 0) + se.quantity
+                slot = {
+                    "required": total_qty,
+                    "delivered": 0,
+                    "station": None,
+                    "required_per_sku": required_per_sku,
+                    "delivered_per_sku": {},
+                }
+                self._packaging_slots[order.order_number] = slot
+            slot["delivered"] += qty
+            per_sku = slot.setdefault("delivered_per_sku", {})
+            per_sku[sku_entry.sku] = per_sku.get(sku_entry.sku, 0) + qty
+            if slot["delivered"] >= slot["required"]:
+                logger.info(
+                    "step=%d: order=%s COMPLETE (abstract picker drain)",
+                    self._cur_steps, order.order_number,
+                )
+                del self._packaging_slots[order.order_number]
+            if bin_ is not None:
+                self._maybe_mark_bin_fulfilled(bin_)
+            budget -= qty
+        self._abstract_picker_carry = budget
+
     def step(
         self, macro_actions: List[int]
     ) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], Dict]:
@@ -3160,7 +3269,10 @@ class Warehouse(gym.Env):
 
         agvs_distance_travelled = self.attribute_macro_actions(macro_actions)
         clashes_count = self.resolve_move_conflict(self.agents)
-        picker_yields_count = self._apply_picker_yield_to_agvs()
+        if self.picker_model == "physical":
+            picker_yields_count = self._apply_picker_yield_to_agvs()
+        else:
+            picker_yields_count = 0
         stucks_count = self.resolve_stuck_agents()
 
         rewards = np.zeros(self.num_agents)
@@ -3168,7 +3280,10 @@ class Warehouse(gym.Env):
         self._step_deliveries = 0
         self._step_items_picked = 0
         rewards = self.execute_micro_actions(rewards)
-        self._advance_pickers()
+        if self.picker_model == "physical":
+            self._advance_pickers()
+        else:
+            self._drain_pickerwall_abstract()
         rewards, shelf_deliveries = self.process_shelf_deliveries(rewards)
 
         self._recalc_grid()
@@ -3215,8 +3330,11 @@ class Warehouse(gym.Env):
         else:
             terminateds = truncateds = self.num_agents * [False]
 
-        self.observation_space_mapper.extract_environment_info(self)
-        new_obs = tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
+        if self.observation_space_mapper is None:
+            new_obs = tuple([0] * self.num_agents)
+        else:
+            self.observation_space_mapper.extract_environment_info(self)
+            new_obs = tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
         episode_done = bool(all(terminateds) or all(truncateds))
         info = self._build_info(
             agvs_distance_travelled,
