@@ -1,6 +1,7 @@
 import json
 import logging
 from collections import deque
+import heapq
 import math
 import os
 import random
@@ -35,6 +36,8 @@ _PICKER_BLOCKED_REROUTE_THRESHOLD = 4  # consecutive blocked steps before a pick
 _PICK_TICKS = 10  # Steps a picker spends picking from a shelf
 _PICKER_CAPACITY = 12  # Number of item-units a picker can carry per trip (e.g. 10 units of SKU A, or 5 units of SKU A + 5 units of SKU B)
 _AGV_TRANSFER_SECONDS = 10.0  # Simulated seconds an AGV spends loading/unloading a bin
+_AGV_RESERVATION_HORIZON = 48
+_AGV_RESERVATION_GOAL_HOLD_STEPS = 6
 # Tiles:
 # - 0: AGV highway
 # - 1: shelf/storage
@@ -369,6 +372,19 @@ class Warehouse(gym.Env):
         self.agv_transfer_base_seconds = max(
             self.time_config.simulated_seconds_per_step,
             float(os.getenv("TARWARE_AGV_TRANSFER_BASE_SECONDS", str(_AGV_TRANSFER_SECONDS))),
+        )
+        self.use_agv_reservation_planner = os.getenv(
+            "TARWARE_AGV_RESERVATION_PLANNER", "1"
+        ).lower() in ("1", "true", "yes")
+        self.agv_reservation_horizon = max(
+            1, int(os.getenv("TARWARE_AGV_RESERVATION_HORIZON", str(_AGV_RESERVATION_HORIZON)))
+        )
+        self.agv_reservation_goal_hold_steps = max(
+            0,
+            int(os.getenv(
+                "TARWARE_AGV_RESERVATION_GOAL_HOLD_STEPS",
+                str(_AGV_RESERVATION_GOAL_HOLD_STEPS),
+            )),
         )
         self.human_factors_config = HumanFactorsConfig.from_env(
             map_name=Path(map_csv_path).stem,
@@ -810,7 +826,186 @@ class Warehouse(gym.Env):
         skip_start = 0 if cost[start[0], start[1]] > 1 else 1
         return [(c, r) for r, c in astar_path[skip_start:].tolist()]
 
-    def find_agv_path_through_adjacent_loc(self, start: Tuple[int, int], goal: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
+    def _agv_static_blocked(
+        self,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        care_for_agents: bool,
+        agent: Optional[Agent] = None,
+    ) -> np.ndarray:
+        blocked = (self.highways == 0)
+        if care_for_agents:
+            blocked = blocked | (self.grid[CollisionLayers.AGVS] != 0)
+            blocked = blocked | (self.grid[CollisionLayers.PICKERS] != 0)
+            for agv in self.agents:
+                blocked[agv.y, agv.x] = False
+        blocked[goal[0], goal[1]] = False
+        blocked[start[0], start[1]] = False
+        return blocked
+
+    def _build_agv_reservations(
+        self,
+        exclude_agent: Optional[Agent] = None,
+    ) -> Tuple[set, set]:
+        """Build AGV cell/edge reservations from current planned paths."""
+        horizon = self.agv_reservation_horizon
+        hold_steps = self.agv_reservation_goal_hold_steps
+        reserved_cells = set()
+        reserved_edges = set()
+
+        for other in self.agents:
+            if other is exclude_agent:
+                continue
+
+            prev = (other.x, other.y)
+            reserved_cells.add((prev[0], prev[1], 0))
+            projected = self._project_agv_path_with_turns(other, horizon)
+
+            for t, xy in enumerate(projected, start=1):
+                xy = tuple(xy)
+                reserved_cells.add((xy[0], xy[1], t))
+                if xy != prev:
+                    reserved_edges.add((prev[0], prev[1], xy[0], xy[1], t))
+                prev = xy
+
+            last_t = len(projected)
+            hold_until = min(horizon, last_t + hold_steps)
+            for hold_t in range(last_t + 1, hold_until + 1):
+                reserved_cells.add((prev[0], prev[1], hold_t))
+
+        return reserved_cells, reserved_edges
+
+    def _project_agv_path_with_turns(
+        self,
+        agent: Agent,
+        horizon: int,
+    ) -> List[Tuple[int, int]]:
+        projected: List[Tuple[int, int]] = []
+        x, y = agent.x, agent.y
+        direction = agent.dir
+
+        for target in list(agent.path or []):
+            target = tuple(target)
+            wait_target = target == (x, y)
+            while len(projected) < horizon and target != (x, y):
+                action = get_next_micro_action(x, y, direction, target)
+                if action == Action.FORWARD:
+                    x, y = target
+                    projected.append((x, y))
+                else:
+                    wraplist = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+                    if action == Action.RIGHT:
+                        direction = wraplist[(wraplist.index(direction) + 1) % len(wraplist)]
+                    elif action == Action.LEFT:
+                        direction = wraplist[(wraplist.index(direction) - 1) % len(wraplist)]
+                    projected.append((x, y))
+            if len(projected) >= horizon:
+                break
+            if wait_target and len(projected) < horizon:
+                projected.append((x, y))
+
+        return projected
+
+    def find_agv_path_reservation_aware(
+        self,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        care_for_agents: bool = True,
+        agent: Optional[Agent] = None,
+    ) -> List[Tuple[int, int]]:
+        """Time-aware AGV A* that avoids other AGVs' reserved cells and edges."""
+        if start == goal:
+            return []
+
+        blocked = self._agv_static_blocked(start, goal, care_for_agents, agent=agent)
+        reserved_cells, reserved_edges = self._build_agv_reservations(exclude_agent=agent)
+        rows, cols = self.grid_size
+        min_dist = abs(start[0] - goal[0]) + abs(start[1] - goal[1])
+        max_time = max(self.agv_reservation_horizon, min_dist + self.agv_reservation_horizon)
+
+        def heuristic(row: int, col: int) -> int:
+            return abs(row - goal[0]) + abs(col - goal[1])
+
+        frontier = [(heuristic(start[0], start[1]), 0, start[0], start[1])]
+        best_g = {(start[0], start[1], 0): 0}
+        came_from: Dict[Tuple[int, int, int], Optional[Tuple[int, int, int]]] = {
+            (start[0], start[1], 0): None
+        }
+        moves = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+        goal_state = None
+
+        while frontier:
+            _, t, row, col = heapq.heappop(frontier)
+            state = (row, col, t)
+            if best_g.get(state) != t:
+                continue
+            if (row, col) == goal:
+                goal_state = state
+                break
+            if t >= max_time:
+                continue
+
+            for dr, dc in moves:
+                nr, nc = row + dr, col + dc
+                nt = t + 1
+                if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
+                    continue
+                if blocked[nr, nc]:
+                    continue
+
+                from_xy = (col, row)
+                to_xy = (nc, nr)
+                if nt <= self.agv_reservation_horizon:
+                    if (to_xy[0], to_xy[1], nt) in reserved_cells:
+                        continue
+                    if to_xy != from_xy and (
+                        to_xy[0], to_xy[1], from_xy[0], from_xy[1], nt
+                    ) in reserved_edges:
+                        continue
+
+                next_state = (nr, nc, nt)
+                if nt >= best_g.get(next_state, math.inf):
+                    continue
+                best_g[next_state] = nt
+                came_from[next_state] = state
+                heapq.heappush(frontier, (nt + heuristic(nr, nc), nt, nr, nc))
+
+        if goal_state is None:
+            return []
+
+        cells_rc = []
+        state = goal_state
+        while state is not None:
+            row, col, _ = state
+            cells_rc.append((row, col))
+            state = came_from[state]
+        cells_rc.reverse()
+        if not cells_rc or cells_rc[0] != start:
+            return []
+        return [(col, row) for row, col in cells_rc[1:]]
+
+    def plan_agv_path(
+        self,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        care_for_agents: bool = True,
+        agent: Optional[Agent] = None,
+    ) -> List[Tuple[int, int]]:
+        if self.use_agv_reservation_planner and care_for_agents:
+            path = self.find_agv_path_reservation_aware(
+                start, goal, care_for_agents=care_for_agents, agent=agent
+            )
+            if path:
+                return path
+        return self.find_agv_path(start, goal, care_for_agents)
+
+    def find_agv_path_through_adjacent_loc(
+        self,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        care_for_agents: bool = True,
+        agent: Optional[Agent] = None,
+    ) -> List[Tuple[int, int]]:
         """Find path from start to goal that goes through via. Returns [] if no path exists."""
         gr, gc = goal
         rows, cols = self.grid_size
@@ -825,7 +1020,7 @@ class Warehouse(gym.Env):
         best_via = None
         best_path: List[Tuple[int, int]] = []
         for entry_rc in entries:
-            p = self.find_agv_path(start, entry_rc, care_for_agents)
+            p = self.plan_agv_path(start, entry_rc, care_for_agents, agent=agent)
             if p and (not best_path or len(p) < len(best_path)):
                 best_via = entry_rc
                 best_path = p
@@ -833,12 +1028,18 @@ class Warehouse(gym.Env):
         path_to_via = best_path
         if not path_to_via:
             return []
-        path_from_via = self.find_agv_path(via, goal, care_for_agents)
+        path_from_via = self.plan_agv_path(via, goal, care_for_agents, agent=agent)
         if not path_from_via:
             return []
         return path_to_via + path_from_via
     
-    def find_agv_path_to_target_entry(self, start: Tuple[int, int], target_rc: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
+    def find_agv_path_to_target_entry(
+        self,
+        start: Tuple[int, int],
+        target_rc: Tuple[int, int],
+        care_for_agents: bool = True,
+        agent: Optional[Agent] = None,
+    ) -> List[Tuple[int, int]]:
         """Route an AGV to the nearest highway cell adjacent to target_rc (row, col).
 
         Used when the target is a non-highway cell (shelf tile 1) so the AGV
@@ -858,12 +1059,18 @@ class Warehouse(gym.Env):
         ]
         best_path: List[Tuple[int, int]] = []
         for entry_rc in entries:
-            p = self.find_agv_path(start, entry_rc, care_for_agents)
+            p = self.plan_agv_path(start, entry_rc, care_for_agents, agent=agent)
             if p and (not best_path or len(p) < len(best_path)):
                 best_path = p
         return best_path
 
-    def find_agv_path_to_goal_entry(self, start: Tuple[int, int], goal_xy: Tuple[int, int], care_for_agents: bool = True) -> List[Tuple[int, int]]:
+    def find_agv_path_to_goal_entry(
+        self,
+        start: Tuple[int, int],
+        goal_xy: Tuple[int, int],
+        care_for_agents: bool = True,
+        agent: Optional[Agent] = None,
+    ) -> List[Tuple[int, int]]:
         """Route an AGV to the nearest highway cell adjacent to goal_xy (col, row).
 
         Used for side drop-off: the AGV stops at a highway cell next to the
@@ -873,7 +1080,7 @@ class Warehouse(gym.Env):
         entries = self._goal_to_agv_entry.get(goal_xy, [])
         best_path: List[Tuple[int, int]] = []
         for (ex, ey) in entries:          # entries stored as (col, row)
-            p = self.find_agv_path(start, (ey, ex), care_for_agents)
+            p = self.plan_agv_path(start, (ey, ex), care_for_agents, agent=agent)
             if p and (not best_path or len(p) < len(best_path)):
                 best_path = p
         return best_path
@@ -1026,24 +1233,24 @@ class Warehouse(gym.Env):
                         # Pickerwall target (pick-up or drop-off): approach from adjacent
                         # highway cell so the AGV never enters the tile-2 slot.
                         agent.path = self.find_agv_path_to_goal_entry(
-                            (agent.y, agent.x), target_xy, care_for_agents=True
+                            (agent.y, agent.x), target_xy, care_for_agents=True, agent=agent
                         )
                         if not agent.path:
                             agent.path = self.find_agv_path_to_goal_entry(
-                                (agent.y, agent.x), target_xy, care_for_agents=False
+                                (agent.y, agent.x), target_xy, care_for_agents=False, agent=agent
                             )
                     elif not self._is_highway(target_rc[1], target_rc[0]):
                         # Non-highway target (shelf tile): approach from an adjacent
                         # highway cell so the AGV never enters the shelf cell directly.
                         agent.path = self.find_agv_path_to_target_entry(
-                            (agent.y, agent.x), target_rc, care_for_agents=True
+                            (agent.y, agent.x), target_rc, care_for_agents=True, agent=agent
                         )
                         if not agent.path:
                             agent.path = self.find_agv_path_to_target_entry(
-                                (agent.y, agent.x), target_rc, care_for_agents=False
+                                (agent.y, agent.x), target_rc, care_for_agents=False, agent=agent
                             )
                     else:
-                        agent.path = self.find_agv_path((agent.y, agent.x), target_rc, care_for_agents=True)
+                        agent.path = self.plan_agv_path((agent.y, agent.x), target_rc, care_for_agents=True, agent=agent)
                         if not agent.path:
                             # Congestion blocked the agent-aware path; fall back to ignoring agents
                             # so the agent can at least start moving. resolve_move_conflict handles
@@ -1053,7 +1260,7 @@ class Warehouse(gym.Env):
                     if agent.path:
                         agent.busy = True
                         agent.target = macro_action
-                        agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
+                        self._set_agv_req_action_from_path(agent)
                         if agent.req_action == Action.FORWARD:
                             # Check if the agent has enough credit to move (e.g. due to configured speed)
                             can_move = self._consume_motion_credit(
@@ -1098,7 +1305,7 @@ class Warehouse(gym.Env):
                     else:
                         agent.req_action = Action.TOGGLE_LOAD
                 else:
-                    agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
+                    self._set_agv_req_action_from_path(agent)
                     if agent.req_action == Action.FORWARD:
                         # Check if the agent has enough credit to move (e.g. due to configured speed)
                         can_move = self._consume_motion_credit(
@@ -1180,11 +1387,21 @@ class Warehouse(gym.Env):
                                 if other.fixing_clash == 0:
                                     clashes+=1
                                     agent.fixing_clash = _FIXING_CLASH_TIME
-                                    new_path = self.find_agv_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), True)
+                                    new_path = self.plan_agv_path(
+                                        (agent.y, agent.x),
+                                        (agent.path[-1][1], agent.path[-1][0]),
+                                        True,
+                                        agent=agent,
+                                    )
                                     if len(new_path) == 1:
                                         # Agents that are stuck and are 1 cell away from their target are likely competing with an AGV that has
                                         # the same dilemma, so, re-route agent to the target through an adjacent cell to the target.
-                                        new_path = self.find_agv_path_through_adjacent_loc((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), True)
+                                        new_path = self.find_agv_path_through_adjacent_loc(
+                                            (agent.y, agent.x),
+                                            (agent.path[-1][1], agent.path[-1][0]),
+                                            True,
+                                            agent=agent,
+                                        )
                                     if new_path != []:
                                         agent.path = new_path
                                     else:
@@ -1233,10 +1450,11 @@ class Warehouse(gym.Env):
                 agent.fixing_clash = _FIXING_CLASH_TIME
 
             if agent.path:
-                new_path = self.find_agv_path(
+                new_path = self.plan_agv_path(
                     (agent.y, agent.x),
                     (agent.path[-1][1], agent.path[-1][0]),
                     care_for_agents=True,
+                    agent=agent,
                 )
                 if len(new_path) == 1:
                     # Agents that are stuck and are 1 cell away from their target are likely competing with a picker that has
@@ -1245,6 +1463,7 @@ class Warehouse(gym.Env):
                         (agent.y, agent.x),
                         (agent.path[-1][1], agent.path[-1][0]),
                         care_for_agents=True,
+                        agent=agent,
                     )
                 if new_path:
                     agent.path = new_path
@@ -1386,6 +1605,19 @@ class Warehouse(gym.Env):
 
     def _agv_transfer_ticks(self) -> int:
         return max(1, self.simulated_seconds_to_steps(self.agv_transfer_base_seconds))
+
+    def _set_agv_req_action_from_path(self, agent: Agent) -> None:
+        if not agent.path:
+            agent.req_action = Action.NOOP
+            return
+
+        next_xy = tuple(agent.path[0])
+        if next_xy == (agent.x, agent.y):
+            agent.req_action = Action.NOOP
+            agent.path = agent.path[1:]
+            return
+
+        agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, next_xy)
 
     def _execute_agv_transfer(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
         if agent.transfer_ticks_remaining <= 0:
@@ -3365,6 +3597,8 @@ class Warehouse(gym.Env):
         info["stucks"] = stucks_count
         info["agvs_distance_travelled"] = agvs_distance_travelled
         info["agvs_idle_time"] = agvs_idle_time
+        info["agv_reservation_planner_enabled"] = bool(self.use_agv_reservation_planner)
+        info["agv_reservation_horizon"] = int(self.agv_reservation_horizon)
         info["steps_per_simulated_second"] = self.time_config.steps_per_simulated_second
         info["simulated_seconds"] = self.steps_to_simulated_seconds(self._cur_steps)
         info["real_seconds"] = self.steps_to_real_seconds(self._cur_steps)

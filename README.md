@@ -14,6 +14,7 @@
   - [Action Space](#action-space)
   - [Observation Space](#observation-space)
   - [Dynamics: Collisions](#dynamics-collisions)
+  - [AGV Reservation Planner](#agv-reservation-planner)
   - [Rewards](#rewards)
 - [Environment Parameters](#environment-parameters)
   - [Naming Scheme](#naming-scheme)
@@ -65,6 +66,20 @@ We note the distinction to the original RWARE environment, where the observation
 ## Dynamics: Collisions
 
 Collision dynamics are modeled by adapting the original RWARE implementation to the A* path-finding based traversal. Whenever a clash happens (agent i steps on a current/future position of agent j), the agent goes into a "fixing_clash" state where it recomputes its trajectory towards the target location while taking the current position of the other agents into account. We note that this logic might lead to deadlock states, agents becoming stuck, which we model by allowing the workers a fixed window of time-steps in which they can attempt to recalculate their path. If no viable path was found during this period, the agents become available again and can choose another target location.
+
+## AGV Reservation Planner
+
+AGV routing can use a reservation-aware A* planner to avoid clashes proactively. The planner keeps the existing grid-based A* fallback, but adds a time dimension when planning AGV routes. Other AGVs' planned cells and directed movements are reserved over a bounded future horizon, so new AGV paths avoid both same-cell conflicts and head-on edge swaps. Waiting in place is also allowed, which lets an AGV pause briefly instead of forcing a long detour through congestion.
+
+The planner is controlled through environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TARWARE_AGV_RESERVATION_PLANNER` | `1` | Enables the reservation-aware AGV planner. Set to `0`, `false`, or `no` to use the previous planner behavior for A/B comparisons. |
+| `TARWARE_AGV_RESERVATION_HORIZON` | `48` | Number of future simulation steps considered when avoiding other AGVs' reserved cells and edges. Higher values can reduce clashes but increase planning cost. |
+| `TARWARE_AGV_RESERVATION_GOAL_HOLD_STEPS` | `6` | Number of extra steps an AGV's final planned cell remains reserved after the path ends, approximating loading, unloading, or waiting at a target. Higher values are safer near destinations but may over-block narrow lanes. |
+
+The step `info` dictionary includes `agv_reservation_planner_enabled` and `agv_reservation_horizon` so experiment outputs can record which routing policy was active.
 
 ## Rewards
 At each time a set number of shelves R is requested. When a requested shelf is brought to a goal location, another shelf is uniformly sampled and added to the current requests. AGVs are rewarded for successfully delivering a requested shelf to a goal location, with a reward of 1. Pickers receive a reward of 0.1 whenerver they help an AGV to load/unload a shelf. A significant challenge in these environments is for AGVs to deliver requested shelves but also finding an empty location to return the previously delivered shelf. Having multiple steps between deliveries leads to a sparse reward signal.
